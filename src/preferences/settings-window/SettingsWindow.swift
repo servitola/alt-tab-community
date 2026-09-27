@@ -124,9 +124,7 @@ private final class SettingsSidebarCellView: NSTableCellView {
         let selected = backgroundStyle == .emphasized
         titleLabel.font = NSFont.systemFont(ofSize: 13.5, weight: .medium)
         titleLabel.textColor = selected ? .white : .labelColor
-        if #available(macOS 10.14, *) {
-            iconView.contentTintColor = selected ? .white : .secondaryLabelColor
-        }
+        iconView.contentTintColor = selected ? .white : .secondaryLabelColor
     }
 }
 
@@ -159,18 +157,12 @@ private final class SidebarSearchField: NSSearchField {
 
 class SettingsWindow: NSWindow {
     static let contentWidth = CGFloat(710)
-    static let width = contentWidth
     /// Horizontal margin inside each section between the section's container and the
     /// TableGroupView's rounded background, so the gray-bg blocks "float" inside the section
     /// rather than extend edge-to-edge. The window width includes 2× this on top of the regular
     /// `contentWidth`, so TGVs keep their natural width and gain a visible gutter on each side.
     static let sectionContentHorizontalMargin = CGFloat(15)
-    static let sidebarActionButtonHeight: CGFloat = {
-        let button = NSButton(title: " ", target: nil, action: nil)
-        button.bezelStyle = .rounded
-        return button.fittingSize.height
-    }()
-    private static let sidebarWidth = CGFloat(175)
+    static let sidebarWidth = CGFloat(175)
     /// Outer left pad between the splitview divider and the TableGroupView background. Kept
     /// symmetric with `contentTrailingPadding` so the visible TGV "shoulders" match on both sides.
     private static let contentHorizontalPadding = CGFloat(5)
@@ -192,7 +184,7 @@ class SettingsWindow: NSWindow {
     private static let minWindowHeight = CGFloat(400)
     private static let defaultWindowHeight = CGFloat(570)
     private static let sidebarTopInset = CGFloat(40)
-    private static let sidebarHorizontalPadding = CGFloat(10)
+    static let sidebarHorizontalPadding = CGFloat(10)
     /// Padding inside the row's cell view between the cell's leading edge and the icon.
     /// `NSTableView.style = .sourceList` already inserts the cell content into its rounded
     /// highlight pill, so we only add a small visual breathing-room here.
@@ -204,8 +196,7 @@ class SettingsWindow: NSWindow {
     private static let controlHighlightMaxCornerRadius = CGFloat(9)
     static var shared: SettingsWindow!
 
-    static var canBecomeKey_ = true
-    override var canBecomeKey: Bool { Self.canBecomeKey_ }
+    override var canBecomeKey: Bool { SecondaryWindows.canBecomeKey }
 
     private let splitViewController = NSSplitViewController()
     private let sidebarContainer = NSView()
@@ -269,10 +260,8 @@ class SettingsWindow: NSWindow {
         let toolbar = NSToolbar(identifier: "SettingsToolbar")
         toolbar.showsBaselineSeparator = false
         self.toolbar = toolbar
-        if #available(macOS 11.0, *) {
-            toolbarStyle = .unified
-            titlebarSeparatorStyle = .none
-        }
+        toolbarStyle = .unified
+        titlebarSeparatorStyle = .none
     }
 
     private func setupView() {
@@ -320,9 +309,7 @@ class SettingsWindow: NSWindow {
         rightScrollView.hasVerticalScroller = true
         rightScrollView.hasHorizontalScroller = false
         rightScrollView.scrollerStyle = .overlay
-        if #available(macOS 11.0, *) {
-            rightScrollView.automaticallyAdjustsContentInsets = false
-        }
+        rightScrollView.automaticallyAdjustsContentInsets = false
         rightScrollView.contentInsets = NSEdgeInsetsZero
         rightScrollView.scrollerInsets = NSEdgeInsetsZero
         rightScrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -367,15 +354,7 @@ class SettingsWindow: NSWindow {
 
     private func setupSearchField(_ parent: NSView) {
         searchField.delegate = self
-        searchField.placeholderString = NSLocalizedString("Search", comment: "")
-        searchField.sendsSearchStringImmediately = true
-        searchField.sendsWholeSearchString = true
-        searchField.bezelStyle = .roundedBezel
-        if #available(macOS 26.0, *) {
-            searchField.controlSize = .extraLarge
-        } else if #available(macOS 13.0, *) {
-            searchField.controlSize = .large
-        }
+        searchField.applySearchStyle()
         searchField.translatesAutoresizingMaskIntoConstraints = false
         parent.addSubview(searchField)
         NSLayoutConstraint.activate([
@@ -393,13 +372,10 @@ class SettingsWindow: NSWindow {
         sidebarTableView.headerView = nil
         sidebarTableView.intercellSpacing = NSSize(width: 0, height: 2)
         sidebarTableView.rowHeight = 30
-        sidebarTableView.selectionHighlightStyle = .sourceList
         sidebarTableView.backgroundColor = .clear
         sidebarTableView.focusRingType = .none
         sidebarTableView.usesAlternatingRowBackgroundColors = false
-        if #available(macOS 11.0, *) {
-            sidebarTableView.style = .sourceList
-        }
+        sidebarTableView.style = .sourceList
         sidebarTableView.delegate = self
         sidebarTableView.dataSource = self
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(rawValue: "SettingsSidebarColumn"))
@@ -695,39 +671,6 @@ class SettingsWindow: NSWindow {
         })
     }
 
-    /// True iff any user-visible text in the view subtree matches `query`. Walks the same set of
-    /// view types as `collectSearchContent` (text fields, popups, segmented controls, buttons,
-    /// info popovers, text views) so the match semantics are consistent.
-    private static func subtreeContainsMatch(_ view: NSView, query: String) -> Bool {
-        if let tf = view as? NSTextField {
-            let s = SettingsWindow.trimmedText(tf.stringValue)
-            if !s.isEmpty, SettingsSearch.match(query, in: s) != nil { return true }
-        } else if let pop = view as? NSPopUpButton {
-            let title = SettingsWindow.trimmedText(pop.title)
-            if !title.isEmpty, SettingsSearch.match(query, in: title) != nil { return true }
-            for item in pop.itemTitles {
-                let s = SettingsWindow.trimmedText(item)
-                if !s.isEmpty, SettingsSearch.match(query, in: s) != nil { return true }
-            }
-        } else if let seg = view as? NSSegmentedControl {
-            for i in 0..<seg.segmentCount {
-                let s = SettingsWindow.trimmedText(seg.label(forSegment: i) ?? "")
-                if !s.isEmpty, SettingsSearch.match(query, in: s) != nil { return true }
-            }
-        } else if let btn = view as? NSButton {
-            let s = SettingsWindow.trimmedText(btn.title)
-            if !s.isEmpty, SettingsSearch.match(query, in: s) != nil { return true }
-        } else if let infoButton = view as? ClickHoverImageView {
-            for s in SettingsWindow.searchStrings(infoButton) {
-                if SettingsSearch.match(query, in: s) != nil { return true }
-            }
-        } else if let textView = view as? NSTextView {
-            let s = SettingsWindow.trimmedText(textView.string)
-            if !s.isEmpty, SettingsSearch.match(query, in: s) != nil { return true }
-        }
-        return view.subviews.contains { subtreeContainsMatch($0, query: query) }
-    }
-
     static func highlightTarget(_ infoButton: ClickHoverImageView) -> SettingsSearchHighlightTarget? {
         controlHighlightTarget(infoButton) {
             SettingsWindow.searchStrings(infoButton)
@@ -831,14 +774,6 @@ class SettingsWindow: NSWindow {
         return Array(Set(values))
     }
 
-    private static func searchStrings(_ segmentedControl: NSSegmentedControl) -> [String] {
-        var values = [String]()
-        (0..<segmentedControl.segmentCount).forEach {
-            appendTrimmed(segmentedControl.label(forSegment: $0) ?? "", &values)
-        }
-        return Array(Set(values))
-    }
-
     private static func searchStrings(_ infoButton: ClickHoverImageView) -> [String] {
         var values = [String]()
         infoButton.searchableStrings.forEach {
@@ -894,6 +829,11 @@ class SettingsWindow: NSWindow {
     }
 
     func beginSheetWithSearchHighlight(_ sheet: SheetWindow) {
+        #if DEBUG
+        if Preferences.qaPristine { sheet.animationBehavior = .none }
+        QaSheetAnimation.disable(on: sheet)
+        #endif
+        sheet.contentView?.layoutSubtreeIfNeeded()
         beginSheet(sheet) { [weak self] _ in
             self?.clearSheetHighlights(sheet)
         }
@@ -956,6 +896,7 @@ class SettingsWindow: NSWindow {
         targets.forEach { $0.clear() }
     }
 
+    // periphery:ignore:parameters notification - NotificationCenter selector signature
     @objc private func contentViewBoundsDidChange(_ notification: Notification) {
         let currentY = rightScrollView.contentView.bounds.minY
         if isProgrammaticScrollInProgress {
@@ -1069,6 +1010,7 @@ class SettingsWindow: NSWindow {
         hideAppIfLastWindowIsClosed()
         super.close()
     }
+
 }
 
 extension SettingsWindow: NSWindowDelegate {
@@ -1090,7 +1032,8 @@ extension SettingsWindow: NSWindowDelegate {
         // Defer to the next runloop tick: tearing down view trees, removing observers,
         // and dropping the last strong ref to `self` while AppKit is still inside its own
         // close machinery causes objc_release crashes on re-entry.
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, SettingsWindow.shared === self else { return }
             AppearanceTab.cleanup()
             ControlsTab.cleanup()
             GeneralTab.cleanup()

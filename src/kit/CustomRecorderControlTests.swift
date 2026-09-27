@@ -71,6 +71,70 @@ final class CustomRecorderControlTests: XCTestCase {
         XCTAssertEqual(CustomRecorderControlTestable.isShortcutAcceptable("nextWindowShortcut", Shortcut(keyEquivalent: "t")!), .accepted)
     }
 
+    /// Issue #5455. The reporter's configuration (from their `defaults read`): S1 = hold ⌘ + press ⎋,
+    /// S2 = hold ⌥ + press `. That already double-assigns ⌘⎋: Cancel is ⎋, and under S1's own ⌘ hold
+    /// that is S1's trigger. Nothing re-validates a saved configuration, so the pair sits there. Their
+    /// config predates a validation hole being plugged, but note the UI can still produce such a pair:
+    /// "Unassign existing shortcut and continue" unassigns the ONE conflict it named, then applies the
+    /// edit without re-checking, so a second conflict from that same edit lands silently.
+    ///
+    /// Giving another shortcut a ⌘ hold, which is how you reach ⌘` from there, recomputes Cancel under
+    /// ⌘, lands on that same ⌘⎋, and was rejected with "already assigned to Shortcut 1 - Trigger": a
+    /// collision the edit doesn't introduce, naming a shortcut the user isn't touching and can only
+    /// resolve by unassigning it. Only a collision the edit actually introduces should be reported.
+    func testIsShortcutAcceptable_preExistingCollisionDoesNotBlockAnUnrelatedEdit() {
+        ControlsTab.shortcuts = ControlsTab.defaultShortcuts
+        ControlsTab.shortcuts["holdShortcut"] = ATShortcut(Shortcut(keyEquivalent: "⌘")!, "holdShortcut", .global, .up, 0)
+        ControlsTab.shortcuts["nextWindowShortcut"] = ATShortcut(Shortcut(keyEquivalent: "⌘⎋")!, "nextWindowShortcut", .global, .down)
+        ControlsTab.shortcuts["nextWindowShortcut2"] = ATShortcut(Shortcut(keyEquivalent: "⌥`")!, "nextWindowShortcut2", .global, .down)
+        defer { ControlsTab.shortcuts = ControlsTab.defaultShortcuts }
+        // the edit the reporter couldn't make: S2's hold ⌥ -> ⌘, giving them ⌘`
+        XCTAssertEqual(CustomRecorderControlTestable.isShortcutAcceptable("holdShortcut2", Shortcut(keyEquivalent: "⌘")!), .accepted)
+        // a collision the edit DOES introduce is still reported: ⌥⎋ is free today, so giving S2 the
+        // press ⎋ newly clashes with Cancel under S2's own ⌥ hold
+        XCTAssertEqual(CustomRecorderControlTestable.isShortcutAcceptable("nextWindowShortcut2", Shortcut(keyEquivalent: "⎋")!),
+            .conflictWithExistingShortcut(shortcutAlreadyAssigned: "cancelShortcut"))
+    }
+
+    /// Same as above for the modifiers-only branch of `chordsCollide`, where the pre-existing pair
+    /// collides by superset rather than by equal chords: S1 = ⌥+⇧ and S2 = ⌘⌥+⇧ already satisfy each
+    /// other. Widening S2's hold keeps that pair colliding exactly as it was, so it must not be
+    /// reported; a superset collision the edit does introduce still must be.
+    func testIsShortcutAcceptable_preExistingModifiersOnlyCollisionDoesNotBlockAnUnrelatedEdit() {
+        ControlsTab.shortcuts = ControlsTab.defaultShortcuts
+        // it is ⇧, which under S1's ⌥ hold would be a second pre-existing collision, muddying the case
+        ControlsTab.shortcuts["previousWindowShortcut"] = nil
+        ControlsTab.shortcuts["nextWindowShortcut"] = ATShortcut(Shortcut(keyEquivalent: "⌥⇧")!, "nextWindowShortcut", .global, .down)
+        ControlsTab.shortcuts["holdShortcut2"] = ATShortcut(Shortcut(keyEquivalent: "⌘⌥")!, "holdShortcut2", .global, .up, 1)
+        ControlsTab.shortcuts["nextWindowShortcut2"] = ATShortcut(Shortcut(keyEquivalent: "⌘⌥⇧")!, "nextWindowShortcut2", .global, .down)
+        defer { ControlsTab.shortcuts = ControlsTab.defaultShortcuts }
+        XCTAssertEqual(CustomRecorderControlTestable.isShortcutAcceptable("holdShortcut2", Shortcut(keyEquivalent: "⌘⌥⌃")!), .accepted)
+        // S3 = ⌃+⇧ is uninvolved in that pair and collides with nothing today, so widening its hold to
+        // ⌥⌃, which makes its ⇧ press a superset of S1's ⌥⇧, is a collision the edit does introduce
+        ControlsTab.shortcuts["holdShortcut3"] = ATShortcut(Shortcut(keyEquivalent: "⌃")!, "holdShortcut3", .global, .up, 2)
+        ControlsTab.shortcuts["nextWindowShortcut3"] = ATShortcut(Shortcut(keyEquivalent: "⌃⇧")!, "nextWindowShortcut3", .global, .down)
+        XCTAssertEqual(CustomRecorderControlTestable.isShortcutAcceptable("holdShortcut3", Shortcut(keyEquivalent: "⌥⌃")!),
+            .conflictWithExistingShortcut(shortcutAlreadyAssigned: "nextWindowShortcut"))
+    }
+
+    /// `chordsCollide` has to catch a modifiers-only pair whichever way the containment runs. The 2
+    /// tests above only ever make the CANDIDATE's chord the superset, so they pass just as well with
+    /// the other direction dropped. Here the candidate's chord is the subset instead: S1 = ⌘⌥+⇧ and
+    /// S2 = ⌃+⇧ collide with nothing, and narrowing S2's hold to ⌘ makes its ⇧ press ⌘⇧, which S1's
+    /// ⌘⌥⇧ already satisfies.
+    func testIsShortcutAcceptable_modifiersOnlyCollidesWhenTheCandidateChordIsTheSubset() {
+        ControlsTab.shortcuts = ControlsTab.defaultShortcuts
+        ControlsTab.shortcuts["previousWindowShortcut"] = nil
+        ControlsTab.shortcuts["holdShortcut3"] = nil
+        ControlsTab.shortcuts["holdShortcut"] = ATShortcut(Shortcut(keyEquivalent: "⌘⌥")!, "holdShortcut", .global, .up, 0)
+        ControlsTab.shortcuts["nextWindowShortcut"] = ATShortcut(Shortcut(keyEquivalent: "⌘⌥⇧")!, "nextWindowShortcut", .global, .down)
+        ControlsTab.shortcuts["holdShortcut2"] = ATShortcut(Shortcut(keyEquivalent: "⌃")!, "holdShortcut2", .global, .up, 1)
+        ControlsTab.shortcuts["nextWindowShortcut2"] = ATShortcut(Shortcut(keyEquivalent: "⌃⇧")!, "nextWindowShortcut2", .global, .down)
+        defer { ControlsTab.shortcuts = ControlsTab.defaultShortcuts }
+        XCTAssertEqual(CustomRecorderControlTestable.isShortcutAcceptable("holdShortcut2", Shortcut(keyEquivalent: "⌘")!),
+            .conflictWithExistingShortcut(shortcutAlreadyAssigned: "nextWindowShortcut"))
+    }
+
     func testIsShortcutAcceptable_reservedByMacos() {
         XCTAssertEqual(CustomRecorderControlTestable.isShortcutAcceptable("previousWindowShortcut", Shortcut(keyEquivalent: "⌘⇧")!), .accepted) // ⌘⎋
         XCTAssertEqual(CustomRecorderControlTestable.isShortcutAcceptable("previousWindowShortcut", Shortcut(keyEquivalent: "⌘⌃⇧")!), .accepted) // ⌘⎋
@@ -140,62 +204,6 @@ final class CustomRecorderControlTests: XCTestCase {
         XCTAssertTrue(CustomRecorderControlTestable.isWellFormedCandidateId("cancelShortcut"))
         XCTAssertTrue(CustomRecorderControlTestable.isWellFormedCandidateId("←"))
         XCTAssertTrue(CustomRecorderControlTestable.isWellFormedCandidateId("vimCycleLeft"))
-    }
-
-    // MARK: - combinedModifiersMatch
-
-    // Per the kernel's doc-comment: the function checks whether two modifier sets match once each is
-    // OR-ed with the configured holdShortcut's modifiers. This is what lets the matcher recognize a
-    // chord like commandShiftTab whose modifiers are physically split between a holdShortcut (e.g.
-    // ⌘⌥) and a local shortcut (e.g. ⇧).
-
-    /// A modifier set OR-ed with the hold modifiers matches itself — the trivial case keyed by the
-    /// hold-modifier union, not by raw equality.
-    func testCombinedModifiersMatchEqualToItself() {
-        ControlsTab.shortcuts = ControlsTab.defaultShortcuts
-        let modifiers = Shortcut(keyEquivalent: "⌥")!.carbonModifierFlags
-        XCTAssertTrue(CustomRecorderControlTestable.combinedModifiersMatch(modifiers, modifiers))
-    }
-
-    /// With holdShortcut at ⌥, two physically different modifier sets that produce the same union
-    /// (`holdMods | x`) for some hold slot match. Here both ⌘⌥ and ⌥ collapse to ⌘⌥ once OR-ed
-    /// with the ⌘⌥ hold modifiers from slot 1.
-    func testCombinedModifiersMatchUnifiesWhenHoldModifiersDominate() {
-        ControlsTab.shortcuts = ControlsTab.defaultShortcuts
-        ControlsTab.shortcuts["holdShortcut"] = ATShortcut(Shortcut(keyEquivalent: "⌘⌥")!, "holdShortcut", .global, .up)
-        defer { ControlsTab.shortcuts = ControlsTab.defaultShortcuts }
-        let cmdOpt = Shortcut(keyEquivalent: "⌘⌥")!.carbonModifierFlags
-        let opt = Shortcut(keyEquivalent: "⌥")!.carbonModifierFlags
-        XCTAssertTrue(CustomRecorderControlTestable.combinedModifiersMatch(cmdOpt, opt),
-            "⌘⌥ | ⌘⌥ == ⌘⌥, and ⌘⌥ | ⌥ == ⌘⌥ — both equal, so they match.")
-    }
-
-    /// Disjoint modifier sets that can't be unified by any holdShortcut union do not match.
-    /// We clear every hold slot first so the test isn't sensitive to which slots the
-    /// defaults populate.
-    func testCombinedModifiersMatchRejectsDisjointModifiers() {
-        let original = ControlsTab.shortcuts
-        for i in 0..<Preferences.maxShortcutCount {
-            ControlsTab.shortcuts[Preferences.indexToName("holdShortcut", i)] = nil
-        }
-        ControlsTab.shortcuts["holdShortcut"] = ATShortcut(Shortcut(keyEquivalent: "⌥")!, "holdShortcut", .global, .up)
-        defer { ControlsTab.shortcuts = original }
-        let cmd = Shortcut(keyEquivalent: "⌘")!.carbonModifierFlags
-        let ctrl = Shortcut(keyEquivalent: "⌃")!.carbonModifierFlags
-        // ⌥|⌘ == ⌘⌥, ⌥|⌃ == ⌃⌥ — different, so no match.
-        XCTAssertFalse(CustomRecorderControlTestable.combinedModifiersMatch(cmd, ctrl))
-    }
-
-    /// When no holdShortcut is configured at any slot, the function returns false — no slot can
-    /// produce a union to compare against.
-    func testCombinedModifiersMatchReturnsFalseWhenNoHoldShortcuts() {
-        let original = ControlsTab.shortcuts
-        for i in 0..<Preferences.maxShortcutCount {
-            ControlsTab.shortcuts[Preferences.indexToName("holdShortcut", i)] = nil
-        }
-        defer { ControlsTab.shortcuts = original }
-        let opt = Shortcut(keyEquivalent: "⌥")!.carbonModifierFlags
-        XCTAssertFalse(CustomRecorderControlTestable.combinedModifiersMatch(opt, opt))
     }
 
     // Note on `Shortcut.keyEquivalent` (defined in `CustomRecorderControlTestable.swift`):

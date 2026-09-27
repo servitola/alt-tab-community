@@ -5,8 +5,9 @@ import AppCenterCrashes
 import Sparkle
 
 class App: AppCenterApplication {
-    /// periphery:ignore
-    static let activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
+    /// Held for the process lifetime. `static let` is lazy, so `init` has to touch it or App Nap is never
+    /// disabled.
+    private static let activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
         reason: "Prevent App Nap to preserve responsiveness")
     static let bundleIdentifier = Bundle.main.bundleIdentifier!
     static let bundleURL = Bundle.main.bundleURL
@@ -25,18 +26,23 @@ class App: AppCenterApplication {
     static var supportProjectAction: Selector { #selector(App.supportProject) }
     static var isTerminating = false
     private static var isVeryFirstSummon = true
+    /// How long the panel waits for the launch inventory when the very first summon arrives before it
+    /// (`showUiOrCycleSelection`). One inventory lands ~280ms after it is asked for, measured.
+    private static let launchInventoryGraceInMs = 400
     private static var pendingShowSettingsWindow = false
+    /// Written once and never read: AppCenter holds its delegate weakly, so this is the strong reference
+    /// that keeps the crash handler alive for the process lifetime.
     // periphery:ignore
     private static var appCenterDelegate: AppCenterCrash?
-    // periphery:ignore
     static var sparkleDelegate: SparkleDelegate?
     static var updaterController: SPUStandardUpdaterController?
     // don't queue multiple delayed rebuildUi() calls
     private static var delayedDisplayScheduled = 0
-    private static let switcherUiRefreshThrottler = Throttler(delayInMs: 200)
+    private static let switcherUiRepaintCoalescer = RepaintCoalescer()
 
     override init() {
         super.init()
+        _ = Self.activity
         delegate = self
     }
 
@@ -62,40 +68,59 @@ class App: AppCenterApplication {
     }
 
     static func hideUi(_ keepPreview: Bool = false) {
+        guard beginHideUi(keepPreview) else { return }
+        endHideUi()
+    }
+
+    /// The part of the dismissal the user can see. `focusSelectedWindow` runs it before asking for the
+    /// focus, so the two things the user is waiting for are both out before any bookkeeping.
+    /// Returns false when the switcher was already hidden.
+    private static func beginHideUi(_ keepPreview: Bool) -> Bool {
+        MainThreadStall.step()
         Logger.debug { "active:\(SwitcherSession.isActive)" }
-        guard SwitcherSession.current != nil else { return } // already hidden
+        guard SwitcherSession.current != nil else { return false } // already hidden
         SwitcherSession.current = nil
+        // The badge read only runs while a session is open, so once this one closes its quiet period has no
+        // next call left to throttle: all it can still do is delay the FIRST read of the next session by up
+        // to a second. An app that cleared its badge in between was drawn with the badge it had cleared for
+        // that whole second (QA DB-02).
+        Applications.dockBadgeThrottler.reset()
+        hideTilesPanelWithoutChangingKeyWindow()
+        if !keepPreview {
+            PreviewPanel.hide()
+        }
+        return true
+    }
+
+    /// The rest of the dismissal, none of it visible. Kept behind the focus request because
+    /// `TilesView.endSearchSession` can stall on the OS text-input services (#5981).
+    private static func endHideUi() {
+        MainThreadStall.step()
+        // Two event-server round trips (`tapIsEnabled`, then `tapEnable`), measured at up to 8ms on
+        // macOS 26.6.2. Behind the focus request rather than in front of it: the tap's callback already
+        // passes Esc through once `SwitcherSession.isActive` is false, so nothing absorbs a key in the gap.
         KeyboardEvents.updateEscapeAbsorptionTap() // session closed: stop tapping keyDown (#5766)
         TilesView.endSearchSession()
         ContextMenuEvents.toggle(false)
         CursorEvents.toggle(false)
         TrackpadEvents.reset()
         Tooltips.hideAll()
-        hideTilesPanelWithoutChangingKeyWindow()
-        if !keepPreview {
-            PreviewPanel.hide()
-        }
         MainMenu.toggle(true)
     }
 
     /// we don't want another window to become key when the TilesPanel is hidden
     static func hideTilesPanelWithoutChangingKeyWindow() {
-        allSecondaryWindowsCanBecomeKey(false)
+        SecondaryWindows.canBecomeKey = false
         TilesPanel.shared.orderOut(nil)
-        allSecondaryWindowsCanBecomeKey(true)
-    }
-
-    private static func allSecondaryWindowsCanBecomeKey(_ canBecomeKey_: Bool) {
-        SettingsWindow.canBecomeKey_ = canBecomeKey_
-        AboutWindow.canBecomeKey_ = canBecomeKey_
-        PermissionsWindow.canBecomeKey_ = canBecomeKey_
-        FeedbackWindow.canBecomeKey_ = canBecomeKey_
-        DebugWindow.canBecomeKey_ = canBecomeKey_
+        SecondaryWindows.canBecomeKey = true
     }
 
     static func focusTarget() {
         guard SwitcherSession.isActive else { return } // already hidden
         let selectedWindow = Windows.selectedWindow()
+        #if DEBUG
+        CliServer.recordSelectionCommit(selectedWindow?.cgWindowId)
+        #endif
         Logger.info { selectedWindow?.debugId }
         focusSelectedWindow(selectedWindow)
     }
@@ -104,6 +129,7 @@ class App: AppCenterApplication {
         GeneralTab.checkForUpdatesNow(sender)
     }
 
+    // periphery:ignore:parameters sender - NSMenuItem target/action signature
     @objc static func checkPermissions(_ sender: NSMenuItem) {
         showPermissionsWindow()
     }
@@ -215,6 +241,7 @@ class App: AppCenterApplication {
     }
 
     static func cycleSelection(_ direction: Direction, allowWrap: Bool = true) {
+        SwitcherSession.current?.searchDiscovery.lastNavigationAt = ProcessInfo.processInfo.systemUptime
         (TilesView.scrollView?.documentView as? TilesDocumentView)?.cancelDraggingTimer()
         CursorEvents.resetDeadzone()
         if direction == .up || direction == .down {
@@ -230,9 +257,10 @@ class App: AppCenterApplication {
     }
 
     static func focusSelectedWindow(_ selectedWindow: Window?) {
-        guard SwitcherSession.isActive else { return } // already hidden
-        hideUi(true)
-        if let window = selectedWindow, MissionControl.state() == .inactive || MissionControl.state() == .showDesktop {
+        MainThreadStall.step()
+        guard beginHideUi(true) else { return } // already hidden
+        let missionControl = MissionControl.state()
+        if let window = selectedWindow, missionControl == .inactive || missionControl == .showDesktop {
             window.focus()
             if Preferences.cursorFollowFocus == .always || (
                 Preferences.cursorFollowFocus == .differentScreen && (Spaces.screenSpacesMap.first { $0.value.contains { space in window.spaceIds.contains(space) } })?.key != NSScreen.active()?.cachedUuid()) {
@@ -241,6 +269,7 @@ class App: AppCenterApplication {
         } else {
             PreviewPanel.hide()
         }
+        endHideUi()
     }
 
     static func moveCursorToSelectedWindow(_ window: Window) {
@@ -250,16 +279,26 @@ class App: AppCenterApplication {
         CGWarpMouseCursorPosition(point)
     }
 
-    static func refreshOpenUiAfterExternalEvent(_ windowsToScreenshot: [Window], windowRemoved: Bool = false) {
+    static func refreshOpenUiAfterExternalEvent(_ windowsToScreenshot: [Window], windowRemoved: Bool = false,
+                                              immediately: Bool = false) {
         WindowThumbnails.refreshAsync(windowsToScreenshot, .refreshUiAfterExternalEvent, windowRemoved: windowRemoved)
-        switcherUiRefreshThrottler.throttleOrProceed {
+        let repaint = {
             guard SwitcherSession.isActive else { return }
             if !Windows.updatesBeforeShowing() { hideUi(); return }
             refreshUi(true)
         }
+        if immediately { switcherUiRepaintCoalescer.requestImmediately(repaint) }
+        else { switcherUiRepaintCoalescer.request(repaint) }
     }
 
+    #if DEBUG
+    static func deferRepaintsForQa(_ milliseconds: Int) {
+        switcherUiRepaintCoalescer.deferRepaints(milliseconds: milliseconds)
+    }
+    #endif
+
     static func refreshUi(_ preserveScrollPosition: Bool = false) {
+        MainThreadStall.step()
         guard SwitcherSession.isActive else { return }
         let preservedScrollOrigin = preserveScrollPosition ? TilesView.currentScrollOrigin() : nil
         Windows.updateSelectedWindow()
@@ -275,6 +314,7 @@ class App: AppCenterApplication {
     }
 
     static func showUiOrCycleSelection(_ shortcutIndex: Int, _ forceDoNothingOnRelease_: Bool) {
+        MainThreadStall.step()
         let session = SwitcherSession.current ?? {
             let new = SwitcherSession()
             // The window set as it stood at the press. Only something ABSENT from it can be a newcomer that
@@ -289,10 +329,12 @@ class App: AppCenterApplication {
         UsageStats.recordTrigger(shortcutIndex)
         if session.isFirstSummon || shortcutIndex != session.shortcutIndex {
             NSScreen.updatePreferred()
+            let isLaunchSummon = isVeryFirstSummon
             if isVeryFirstSummon {
-                Windows.sortByLevel()
+                Windows.endStartupOrderSeeding()
                 isVeryFirstSummon = false
             }
+            if !session.isFirstSummon { SearchDiscoveryHint.shared.cancel() }
             session.isFirstSummon = false
             session.shortcutIndex = shortcutIndex
             // Hide instantly so the rebuild for a different shortcut (Appearance change, layout
@@ -306,13 +348,23 @@ class App: AppCenterApplication {
             }
             if !Windows.updatesBeforeShowing() { hideUi(); return }
             Windows.setInitialSelectedAndHoveredWindowIndex()
-            if Preferences.windowDisplayDelay == DispatchTimeInterval.milliseconds(0) {
+            // The very first summon of a launch can beat the launch inventory: AltTab has been alive for a
+            // few hundred milliseconds, nothing has been discovered yet, and the panel opens EMPTY and fills
+            // itself under the user's eyes a beat later. Nobody is served by that frame. Ask for the scan
+            // now and let the panel wait for it — capped, because a desktop that genuinely has no window
+            // still has to be told so, and measured against the ~280ms an inventory takes to land.
+            let awaitingLaunchInventory = isLaunchSummon && Windows.list.isEmpty
+            if awaitingLaunchInventory { Applications.manuallyRefreshAllWindows() }
+            let displayDelay = awaitingLaunchInventory
+                ? DispatchTimeInterval.milliseconds(max(Preferences.windowDisplayDelayInMs, launchInventoryGraceInMs))
+                : Preferences.windowDisplayDelay
+            if displayDelay == DispatchTimeInterval.milliseconds(0) {
                 buildUiAndShowPanel()
             } else {
                 delayedDisplayScheduled += 1
-                DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + Preferences.windowDisplayDelay) { () -> () in
+                DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + displayDelay) { () -> () in
                     if delayedDisplayScheduled == 1 {
-                        buildUiAndShowPanel()
+                        buildUiAndShowPanel(true)
                     }
                     delayedDisplayScheduled -= 1
                 }
@@ -323,8 +375,15 @@ class App: AppCenterApplication {
         }
     }
 
-    static func buildUiAndShowPanel() {
+    static func buildUiAndShowPanel(_ listChangedSincePress: Bool = false) {
+        MainThreadStall.step()
         guard SwitcherSession.isActive else { return }
+        // A delayed show renders a list that was filtered at the PRESS. Windows discovered during the delay
+        // are appended with `shouldShowTheUser` still at its default `true`, and the repaint that would
+        // filter them is coalesced onto a trailing edge, so the first frame can draw a window the filters exclude.
+        // Measured on a cold start: three tabs of a 4-tab Finder group were adopted 28ms before the grace
+        // expired, and the group opened unfolded as 3 tiles, then folded a beat later (measured live).
+        if listChangedSincePress, !Windows.updatesBeforeShowing() { hideUi(); return }
         Appearance.update()
         guard SwitcherSession.isActive else { return }
         TilesView.swapBackgroundViewIfNeeded()
@@ -345,15 +404,7 @@ class App: AppCenterApplication {
 
     static func checkIfShortcutsShouldBeDisabled(_ activeWindow: Window?, _ activeApp: Application?) {
         let app = activeWindow?.application ?? activeApp!
-        // The `.whenFullscreen` rule must reflect whether the frontmost app is CURRENTLY showing a fullscreen
-        // window. Don't trust only the window the triggering event carried: it is often nil or stale (RDP's
-        // fullscreen session window can't be AX-acquired, so `focusedWindow` reads nil; an activation fires
-        // before geometry lands). Deriving `isFullscreen` from that alone let the many call sites disagree, so
-        // the toggle flapped and a re-check re-enabled the shortcut mid-fullscreen — AltTab then grabbed Cmd-Tab
-        // inside a fullscreen remote session (#5842, same class as #5228). Read it from the model instead: the
-        // app has a fullscreen window on the current Space. Any trigger now computes the same verdict.
-        let isFullscreen = activeWindow?.isFullscreen == true
-            || Windows.list.contains { $0.application.pid == app.pid && $0.isFullscreen && $0.spaceIds.contains(Spaces.currentSpaceId) }
+        let isFullscreen = attendedWindowIsFullscreen(app, activeWindow)
         let shortcutsShouldBeDisabled = ExceptionMatcher.disablesShortcuts(
             app.state,
             isFullscreen: isFullscreen,
@@ -364,7 +415,30 @@ class App: AppCenterApplication {
         }
     }
 
+    private static func attendedWindowIsFullscreen(_ app: Application, _ activeWindow: Window?) -> Bool {
+        ShortcutExceptionContextResolver.isFullscreen(AttentionEngine.currentUserContext, appPid: app.pid,
+            activeWindowIsFullscreen: activeWindow?.isFullscreen == true,
+            windows: Windows.list.compactMap {
+                guard let wid = $0.cgWindowId else { return nil }
+                return FullscreenWindowEvidence(pid: $0.application.pid, wid: wid,
+                    isFullscreen: $0.isFullscreen, isOnCurrentSpace: $0.spaceIds.contains(Spaces.currentSpaceId))
+            })
+    }
+
+    private static var didContinueAppLaunch = false
+
+    /// Exactly once, whatever asks. `SystemPermissions` polls every 500ms while the permissions window is
+    /// up and hops its "granted" verdict to main, where `preStartupPermissionsPassed` is set, so a
+    /// main-thread stall longer than one tick queues this function twice. A second run starts a second
+    /// input-events thread while the first keeps running (the old RunLoop still retains the old taps'
+    /// sources, so both threads get every event), and the gesture state in `TrackpadEvents` is unlocked on
+    /// the grounds that one thread reaches it. Two of them segfault in `GestureTracker.prune`.
     static func continueAppLaunchAfterPermissionsAreGranted() {
+        guard !didContinueAppLaunch else {
+            Logger.warning { "launch continuation asked for twice; ignoring" }
+            return
+        }
+        didContinueAppLaunch = true
         Logger.info { "System permissions are granted; continuing launch" }
         BackgroundWork.start()
         NSScreen.updatePreferred()
@@ -389,31 +463,39 @@ class App: AppCenterApplication {
         // to have run (the sweep bails on an empty Space list). Deferred a beat so it doesn't compete with the
         // rest of launch.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            // The seed is NOT fired on the next line any more. This refresh is asynchronous: measured
+            // 2026-08-25, its windows land ~280ms later, so a seed here ranked an empty model and the
+            // first-summon call was left doing the whole job, after that summon had already drawn.
+            // `Windows.reseedZOrderDuringStartup` re-makes the guess as the windows actually arrive.
             Applications.manuallyRefreshAllWindows()
-            // Seed the MRU from screen stacking HERE, off the critical path, rather than only on the first
-            // summon: the query blocks, so its answer lands after that summon's first render and the user
-            // watches the list re-order. Seeded now, the first summon's own call finds nothing to change and
-            // draws nothing twice. It still runs there, for the windows this pass could not see yet.
-            Windows.sortByLevel()
         }
         KeyboardEvents.addEventHandlers()
         // Evaluate the "ignore shortcuts" exception for whatever app is already frontmost at launch (#5842):
         // no didActivateApplication fires for it, so without this an app blacklisted with ignore=.always keeps
         // AltTab's shortcut registered after an auto-update relaunch until the user switches away and back.
-        if let frontmostPid = Applications.frontmostPid, let frontmostApp = Applications.findOrCreate(frontmostPid, false) {
+        if let frontmostPid = Applications.frontmostPid, let frontmostApp = Applications.findOrCreate(frontmostPid) {
             checkIfShortcutsShouldBeDisabled(frontmostApp.focusedWindow, frontmostApp)
         }
         CursorEvents.observe()
         TrackpadEvents.observe()
+        // With the other taps, not with `WindowServerEvents`: it needs Accessibility (`tapCreate` returns nil
+        // without it) and the input-devices runloop, neither of which exists before this point.
+        WindowAttentionEvents.observe()
+        // Needs the AX runloop `BackgroundWork.start()` created, so it cannot go with the launch-time setup.
+        AxObserverRegistry.shared.startRecoveryTicks()
         CliEvents.observe()
         App.sparkleDelegate = SparkleDelegate()
         App.updaterController = SPUStandardUpdaterController(
             startingUpdater: false,
             updaterDelegate: App.sparkleDelegate!,
             userDriverDelegate: nil)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
-            App.updaterController?.startUpdater()
+        #if DEBUG
+        if !Preferences.qaPristine {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { App.updaterController?.startUpdater() }
         }
+        #else
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { App.updaterController?.startUpdater() }
+        #endif
         PreferencesEvents.initialize()
         BenchmarkRunner.startIfNeeded()
         showSettingsWindowOnFirstLaunchIfNeeded()
@@ -421,6 +503,7 @@ class App: AppCenterApplication {
             pendingShowSettingsWindow = false
             showSettingsWindow()
         }
+        SearchDiscoveryHint.shared.initialize()
         UsageStats.prune()
         Logger.info { "Finished launching AltTab" }
     }
@@ -431,6 +514,7 @@ extension App: NSApplicationDelegate {
         App.appCenterDelegate = AppCenterCrash()
         App.shared.disableRelaunchOnLogin()
         Logger.initialize()
+        MainThreadStall.observe()
         Logger.info { "Launching AltTab \(App.version)" }
         // Create the background queues first, before anything that can pump the main run loop re-entrantly
         // (the "move to /Applications" modal below, the WindowServer tap's discovery). Window.init reads
@@ -456,6 +540,8 @@ extension App: NSApplicationDelegate {
         #else
         MoveToApplicationsFolder.promptIfNeeded()
         #endif
+        // after the prompt, which may copy this bundle elsewhere and relaunch from there
+        StapledTicket.parkInBackground()
         // The WindowServer event tap is CGS-only (needs no Accessibility, no Preferences, no model), so
         // install it before the permission gate. The skeleton is then available immediately and
         // independent of whether the user has granted AX.
@@ -473,11 +559,14 @@ extension App: NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // symbolic hotkeys state persist after the app is quit; we restore this shortcut before quitting
         setNativeCommandTabEnabled(true)
+        // usage counters are appended in memory and written back on a debounce; land the pending ones
+        UsageStats.flushNow()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         Logger.info { "" }
         makeSureAllCapturesAreFinished()
+        StapledTicket.restoreBeforeExit()
         return .terminateNow
     }
 }

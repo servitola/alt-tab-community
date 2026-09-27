@@ -2,6 +2,7 @@ import Cocoa
 
 class ShortcutsWhenActiveSheet: SheetWindow {
     private static let title = NSLocalizedString("Shortcuts When Active", comment: "")
+    private static let labelSearchHint = NSLocalizedString("Show the search hint", comment: "")
     // Row titles come from `ControlsTab.staticShortcutLabels` (single source of truth, also used by
     // the conflict dialog to name these actions).
     private static let labelFocus = ControlsTab.staticShortcutLabels["focusWindowShortcut"]!
@@ -18,7 +19,7 @@ class ShortcutsWhenActiveSheet: SheetWindow {
     static let searchableStrings: [String] = [
         title,
         labelFocus, labelPrevious, labelCancel,
-        labelSearch,
+        labelSearch, labelSearchHint,
         labelClose, labelMinDemin, labelFullscreen, labelQuit, labelHideShow,
     ]
 
@@ -45,6 +46,7 @@ class ShortcutsWhenActiveSheet: SheetWindow {
         _ = table.addRow(cancelShortcut)
         _ = table.addRow(leftText: Self.labelSearch,
             rightViews: [LabelAndControl.makeLabelWithRecorder(Self.labelSearch, "searchShortcut", Preferences.searchShortcut, labelPosition: .right)[0]])
+        table.addRow(leftText: Self.labelSearchHint, rightViews: [LabelAndControl.makeSwitch("showSearchHint")])
         _ = table.addRow(closeWindowShortcut)
         _ = table.addRow(minDeminWindowShortcut)
         _ = table.addRow(toggleFullscreenWindowShortcut)

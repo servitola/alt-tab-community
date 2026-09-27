@@ -203,6 +203,9 @@
 "Don't hide" = "Don't hide";
 
 /* No comment provided by engineer. */
+"Don't show this search hint again" = "Don't show this search hint again";
+
+/* No comment provided by engineer. */
 "Done" = "Done";
 
 /* No comment provided by engineer. */
@@ -391,6 +394,9 @@
 /* No comment provided by engineer. */
 "Please fill in the form" = "Please fill in the form";
 
+/* Window search hint; placeholder is the configured keyboard shortcut */
+"Press %@ to search your windows." = "Press %@ to search your windows.";
+
 /* No comment provided by engineer. */
 "Preview selected window" = "Preview selected window";
 
@@ -506,19 +512,22 @@
 "Show hidden windows" = "Show hidden windows";
 
 /* No comment provided by engineer. */
-"Show main window" = "Show main window";
-
-/* No comment provided by engineer. */
 "Show minimized windows" = "Show minimized windows";
 
 /* No comment provided by engineer. */
 "Show on" = "Show on";
 
 /* No comment provided by engineer. */
+"Show one window per app" = "Show one window per app";
+
+/* No comment provided by engineer. */
 "Show separate window for each tab" = "Show separate window for each tab";
 
 /* No comment provided by engineer. */
 "Show single window for all tabs" = "Show single window for all tabs";
+
+/* No comment provided by engineer. */
+"Show the search hint" = "Show the search hint";
 
 /* No comment provided by engineer. */
 "Show titles" = "Show titles";

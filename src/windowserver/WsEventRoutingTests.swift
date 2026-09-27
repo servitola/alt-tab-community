@@ -33,7 +33,7 @@ final class WsEventRoutingTests: XCTestCase {
         XCTAssertEqual(WsEventRouting.action(for: .windowDestroyed), .remove)
         XCTAssertEqual(WsEventRouting.action(for: .windowMoved), .updateGeometry)
         XCTAssertEqual(WsEventRouting.action(for: .windowResized), .updateGeometry)
-        XCTAssertEqual(WsEventRouting.action(for: .windowFocused), .bumpFocusOrder)
+        XCTAssertEqual(WsEventRouting.action(for: .windowFocused), .noteFocusEvent)
         XCTAssertEqual(WsEventRouting.action(for: .windowOrderedIn), .refreshVisibility)
         XCTAssertEqual(WsEventRouting.action(for: .windowOrderedOut), .refreshVisibility)
         XCTAssertEqual(WsEventRouting.action(for: .windowAddedToSpace), .updateSpaceMembership)
@@ -42,12 +42,40 @@ final class WsEventRoutingTests: XCTestCase {
         XCTAssertEqual(WsEventRouting.action(for: .activeSpaceChanged), .spaceTransition)
     }
 
-    // MARK: - C. Payload
+    // MARK: - C. Ingress coalescing
 
-    func testOnlySpaceMembershipNotificationsCarrySpaceId() {
-        for n in WsEventRouting.Notification.allCases {
-            let expected = (n == .windowAddedToSpace || n == .windowRemovedFromSpace)
-            XCTAssertEqual(WsEventRouting.payloadCarriesSpaceId(n), expected, "\(n)")
-        }
+    func testGeometryBurstKeepsOnlyTheLatestEventPerWindow() {
+        var ingress = WsEventIngress()
+        ingress.append(event(.windowMoved, wid: 7, at: 1))
+        ingress.append(event(.windowResized, wid: 7, at: 2))
+        ingress.append(event(.windowMoved, wid: 8, at: 3))
+        let drain = ingress.drain()
+        XCTAssertEqual(drain.events, [event(.windowResized, wid: 7, at: 2), event(.windowMoved, wid: 8, at: 3)])
+        XCTAssertEqual(drain.coalescedGeometryEvents, 1)
+    }
+
+    func testSemanticEdgePreventsGeometryFromCrossingIt() {
+        var ingress = WsEventIngress()
+        ingress.append(event(.windowMoved, wid: 7, at: 1))
+        ingress.append(event(.windowFocused, wid: 7, at: 2))
+        ingress.append(event(.windowResized, wid: 7, at: 3))
+        XCTAssertEqual(ingress.drain().events, [
+            event(.windowMoved, wid: 7, at: 1), event(.windowFocused, wid: 7, at: 2),
+            event(.windowResized, wid: 7, at: 3)
+        ])
+    }
+
+    func testDrainResetsTheCoalescingSegment() {
+        var ingress = WsEventIngress()
+        ingress.append(event(.windowMoved, wid: 7, at: 1))
+        _ = ingress.drain()
+        ingress.append(event(.windowResized, wid: 7, at: 2))
+        let drain = ingress.drain()
+        XCTAssertEqual(drain.events, [event(.windowResized, wid: 7, at: 2)])
+        XCTAssertEqual(drain.coalescedGeometryEvents, 0)
+    }
+
+    private func event(_ notification: WsEventRouting.Notification, wid: UInt32, at: TimeInterval) -> WsEventIngress.Event {
+        WsEventIngress.Event(notification: notification, w0: wid, space: 0, widInSpace: 0, at: at)
     }
 }

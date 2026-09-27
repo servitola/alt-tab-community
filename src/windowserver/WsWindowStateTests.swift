@@ -33,16 +33,12 @@ final class WsWindowStateTests: XCTestCase {
         XCTAssertFalse(WsWindowState.isFullscreen(raw(spaceTypeMask: 0x1))) // observed: normal Space
     }
 
-    // MARK: - C. Application-window level hint
-
-    func testApplicationWindowAtLevelZero() {
-        XCTAssertTrue(WsWindowState.isApplicationWindowLevel(raw(level: 0)))
+    func testParentDefaultsToIndependentRoot() {
+        XCTAssertEqual(raw().parentWid, 0)
     }
 
-    func testChromeAndPanelsAreNotApplicationLevel() {
-        for level: Int32 in [3 /* floating panel */, 24 /* menu bar */, 25 /* Control Center */, 2147483630 /* status indicator */] {
-            XCTAssertFalse(WsWindowState.isApplicationWindowLevel(raw(level: level)), "level \(level) is chrome, not an app window")
-        }
+    func testAlphaDefaultsToOpaque() {
+        XCTAssertEqual(raw().alpha, 1)
     }
 
     // MARK: - D. Minimized (the observed `tags` values — see WsWindowStateSpecs.md for the full matrix)

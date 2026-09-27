@@ -70,7 +70,7 @@ final class RealWorldScenariosTests: XCTestCase {
     /// size 757×583. The active tab (29328) holds Space 3 and its AXTabGroup lists all four "~"; the three
     /// background tabs are Space-less and expose no AXTabGroup.
     ///
-    /// **POSITIONS CORRECTED 2026-07-30** (live QA, T-03/T-04). This capture recorded all four tabs at ONE
+    /// **POSITIONS CORRECTED 2026-07-30** (measured live). This capture recorded all four tabs at ONE
     /// position (683,101), which is not what the OS produces: the merge does NOT converge the tabs' frames.
     /// The pre-merge windows keep their cascade positions and the merged window is a BRAND-NEW wid one cascade
     /// step further on, so the group spans four distinct positions 29px apart and only the SIZE is shared:
@@ -80,8 +80,8 @@ final class RealWorldScenariosTests: XCTestCase {
     ///     -2:Terminal#65632(p) sp=[]  757x543@884,219 '~'
     ///     -3:Terminal#65628(p) sp=[]  757x543@855,190 '~'
     ///
-    /// Recorded verbatim from that run, mapped onto this capture's wids in the same MRU order (Finder's merge,
-    /// T-03, is identical in shape: 920×436, 29px cascade). The single position is what made every kernel test
+    /// Recorded verbatim from that run, mapped onto this capture's wids in the same MRU order (Finder's merge is
+    /// identical in shape: 920×436, 29px cascade). The single position is what made every kernel test
     /// here pass while both live merges formed NO group at all — the cascade is exactly what `framePartitions`
     /// splits on, so the four tabs were four partitions of one.
     static let terminalMerge4Tabs: [CapturedWindow] = {
@@ -98,7 +98,32 @@ final class RealWorldScenariosTests: XCTestCase {
         ]
     }()
 
-    /// Finder, Window ▸ Move Tab to New Window (macOS 26, live QA 2026-07-30, T-05). The tab was torn out into
+    /// Two Finder windows of the SAME size parked apart, 3 tabs each, and the top one switching a tab
+    /// (macOS 26, measured live 2026-09-10). The switch takes the top window's active Space-less for the
+    /// handover, which leaves the BOTTOM window as the cluster's only genuine Space holder:
+    ///
+    ///     +0:Finder#166416    g=nil sp=[3] 1000x440@80,600   ← the bottom window's active, declares 3 tabs
+    ///     -1:Finder#166420    g=nil sp=[]  1000x440@80,80    ← the TOP window's ex-active, mid-switch
+    ///     -2:Finder#166413    g=nil sp=[]  1000x440@80,600   ← a real inactive tab of the bottom window
+    ///
+    /// Three members against the bottom window's declared 3, nothing linked yet: the count "accounts for"
+    /// the cluster by coincidence and waives the position split that is the only thing keeping the two
+    /// windows apart. Live, `group form g1 rep=#166416 members=[166416, 166420, 166413] reason=geometry`,
+    /// after which the title path (every Finder window is titled "lwouis") bridged the rest and ONE tile
+    /// stood for both windows.
+    static let finderTabSwitchInASecondSameSizeWindow: [CapturedWindow] = {
+        let sz = CGSize(width: 1000, height: 440)
+        return [
+            CapturedWindow(pid: 11119, wid: 166416, title: "lwouis", subrole: "AXStandardWindow", size: sz,
+                position: CGPoint(x: 80, y: 600), spaceIds: [3], axTabTitles: ["lwouis", "lwouis", "lwouis"]),
+            CapturedWindow(pid: 11119, wid: 166420, title: "lwouis", subrole: "AXStandardWindow", size: sz,
+                position: CGPoint(x: 80, y: 80), spaceIds: [], axTabTitles: ["lwouis", "lwouis", "lwouis"]),
+            CapturedWindow(pid: 11119, wid: 166413, title: "lwouis", subrole: "AXStandardWindow", size: sz,
+                position: CGPoint(x: 80, y: 600), spaceIds: []),
+        ]
+    }()
+
+    /// Finder, Window ▸ Move Tab to New Window (macOS 26, measured live 2026-07-30). The tab was torn out into
     /// its own window at (290,712) and the drag-out was correctly confirmed — then geometry folded it straight
     /// back into the group it had just left:
     ///
@@ -130,6 +155,42 @@ final class RealWorldScenariosTests: XCTestCase {
     ///
     /// Every Finder window is 1000x440, so all three land in one size cluster, and 129425's tab count (3)
     /// happens to equal the cluster's size — the coincidence that waives the position split.
+    /// **rec28 (2026-08-26): a background tab reporting the frame of the WRONG window.** Two Finder
+    /// windows, three tabs each, parked 520pt apart, every window 1000x440 and titled "lwouis" — so one size
+    /// cluster, and POSITION is the only fact separating the two windows.
+    ///
+    /// Window A is parked at (80,80), window B at (80,600). Two kinds of wrong frame appear, and only one is
+    /// benign: A's background tabs sit at (109,109), the cascade offset they had before the park, frozen
+    /// because no geometry event reaches an ordered-out tab — stale, but still A's own history. B's
+    /// background tabs report **(80,80)**, which is A's origin and was never B's. The position split is
+    /// therefore handed a partition holding members of both windows, and the membership union bridges the
+    /// rest in: one group of six under a representative declaring three tabs, five windows undrawn.
+    ///
+    /// Reproduced 4 runs in 8, always this shape. The two ACTIVES are what make it decidable: each declares
+    /// its own 3-tab `AXTabGroup`, so the group that swallowed both is arithmetically impossible.
+    static let finderTabLyingAboutItsWindowActiveA = CapturedWindow(
+        pid: 1357, wid: 70958, title: "lwouis", subrole: "AXStandardWindow",
+        size: CGSize(width: 1000, height: 440), position: CGPoint(x: 80, y: 80), spaceIds: [3],
+        axTabTitles: ["lwouis", "lwouis", "lwouis"])
+    /// A's own tabs, frozen at the pre-park cascade offset. Wrong, but consistent with A.
+    static let finderTabLyingAboutItsWindowTabsA: [CapturedWindow] = [
+        CapturedWindow(pid: 1357, wid: 70953, title: "lwouis", subrole: "AXStandardWindow",
+            size: CGSize(width: 1000, height: 440), position: CGPoint(x: 109, y: 109), spaceIds: []),
+        CapturedWindow(pid: 1357, wid: 70956, title: "lwouis", subrole: "AXStandardWindow",
+            size: CGSize(width: 1000, height: 440), position: CGPoint(x: 109, y: 109), spaceIds: []),
+    ]
+    static let finderTabLyingAboutItsWindowActiveB = CapturedWindow(
+        pid: 1357, wid: 70951, title: "lwouis", subrole: "AXStandardWindow",
+        size: CGSize(width: 1000, height: 440), position: CGPoint(x: 80, y: 600), spaceIds: [3],
+        axTabTitles: ["lwouis", "lwouis", "lwouis"])
+    /// **The lie.** B's background tabs, reporting A's origin — a position that was never theirs.
+    static let finderTabLyingAboutItsWindowTabsB: [CapturedWindow] = [
+        CapturedWindow(pid: 1357, wid: 70944, title: "lwouis", subrole: "AXStandardWindow",
+            size: CGSize(width: 1000, height: 440), position: CGPoint(x: 80, y: 80), spaceIds: []),
+        CapturedWindow(pid: 1357, wid: 70949, title: "lwouis", subrole: "AXStandardWindow",
+            size: CGSize(width: 1000, height: 440), position: CGPoint(x: 80, y: 80), spaceIds: []),
+    ]
+
     static let finderTabSwitchBesideAnotherWindow: [CapturedWindow] = {
         let sz = CGSize(width: 1000, height: 440)
         return [
@@ -222,8 +283,8 @@ final class RealWorldScenariosTests: XCTestCase {
     static let missionControlAxCycle: [String] = ["AXExposeShowAllWindows", "AXExposeExit"]
 
     /// Finder with tabs "lwouis" (inactive, AXValue 0) + "git" (active, AXValue 1) and a separate non-tabbed
-    /// window "Movies". Recorded by the maintainer during the tab-detection investigation (see
-    /// `experimentations/TabbedWindowDetection.swift`): the active tab's AXTabGroup lists ["lwouis", "git"];
+    /// window "Movies". Recorded by the maintainer during the tab-detection investigation: the active tab's
+    /// AXTabGroup lists ["lwouis", "git"];
     /// "Movies" has no AXTabGroup. Distinct titles here (unlike Terminal's `~`), so matching is unambiguous.
     static let finderGitActive = CapturedWindow(pid: 779, wid: 4001, title: "git", subrole: "AXStandardWindow",
         size: CGSize(width: 900, height: 600), position: CGPoint(x: 200, y: 200), spaceIds: [1],
@@ -371,8 +432,8 @@ final class RealWorldScenariosTests: XCTestCase {
     /// A FULLSCREEN tab SWITCH, raw events (2026-07-15 `--tab-diag`). Switching to a background tab emits NO
     /// `windowAddedToSpace` for a TRACKED wid — across every fullscreen recording there was not one. The
     /// incoming tab arrives as an UNTRACKED wid (fullscreen background tabs drop out of tracking) and is
-    /// re-DISCOVERED, while the outgoing active gets its 1326. So a fullscreen switch has no focus signal at
-    /// all: no 808, no create, no add-for-a-tracked-window — the re-discovered tab must be fronted explicitly
+    /// re-DISCOVERED, while the outgoing active gets its 1326. So its physical stream has no promotion for
+    /// the new object: no 808, no create, no add-for-a-tracked-window — it must be fronted explicitly
     /// or it lands at the back of the MRU (the tile appearing "on the right", then jumping left).
     static let fullscreenTabSwitchEvents: [(id: UInt32, space: UInt64, wid: CGWindowID)] = [
         (1325, 4059, 70211),   // windowAddedToSpace — the INCOMING tab, untracked at this point
@@ -392,7 +453,7 @@ final class RealWorldScenariosTests: XCTestCase {
     }
 
     func testMergedTabsFormAGroupFromNothingButTheTabCount() {
-        // The state a merge ACTUALLY leaves (live QA 2026-07-30, T-03 Finder + T-04 Terminal): no window
+        // The state a merge ACTUALLY leaves (measured live 2026-07-30, Finder + Terminal): no window
         // carries a link, because the title path can't make one — every tab is titled "~" and they sit at
         // four DIFFERENT cascade positions, so `positionsCompatible` rejects each candidate. Geometry was the
         // only path left and it never even formed a cluster: `framePartitions` split the four tabs into four
@@ -405,6 +466,15 @@ final class RealWorldScenariosTests: XCTestCase {
         let windows = Self.terminalMerge4Tabs.map { $0.tabWindow() }
         XCTAssertEqual(TabGroupResolver.geometryGroups(windows),
             [GeometryGroup(visibleWid: 29328, backgroundWids: [29326, 29321, 29320])])
+    }
+
+    func testASecondWindowsActiveTabIsNotSweptInByACountItAlsoDeclares() {
+        // The count waiver has to survive a cluster that holds another window's ACTIVE tab: 166420 declares
+        // an AXTabGroup of its own from a different position, so the bottom window's 3 cannot be an account
+        // of all three members however well it adds up.
+        let windows = Self.finderTabSwitchInASecondSameSizeWindow.map { $0.tabWindow() }
+        XCTAssertEqual(TabGroupResolver.geometryGroups(windows),
+            [GeometryGroup(visibleWid: 166416, backgroundWids: [166413])])
     }
 
     func testSeparateWindowsNeverGroup() {
@@ -422,7 +492,7 @@ final class RealWorldScenariosTests: XCTestCase {
     // MARK: - Inactive-tab matching (matchSiblings)
 
     func testADraggedOutWindowIsNotFoldedBackByAStaleTabCount() {
-        // T-05, live 2026-07-30, transcribed from `group form g13 members=[72914, 72915, 72910] reason=geometry
+        // Live 2026-07-30, transcribed from `group form g13 members=[72914, 72915, 72910] reason=geometry
         // | geometryGroup Finder visible#72914 sp[3] background=[72915, 72910]`: the tab was torn out into its
         // own window, the drag-out was correctly confirmed, and then geometry put it straight back.
         //
@@ -449,6 +519,89 @@ final class RealWorldScenariosTests: XCTestCase {
         for group in TabGroupResolver.geometryGroups([active, draggedOut, realTab]) {
             XCTAssertFalse(group.siblingWids.contains(72915),
                            "#72915 was dragged OUT to (290,712) — the group at (1116,683) must not re-claim it")
+        }
+    }
+
+    /// **rec28, at the reducer: the membership union turns one wrong claim into a merged window.**
+    ///
+    /// The kernel test above shows geometry claiming B's two lying tabs into A's group — three members,
+    /// which is within A's declared tab count and so survives every size check. The damage is done by the
+    /// UNION in `discoveryLanded`: having claimed a member of B's group, geometry pulls in that member's
+    /// whole existing membership, and B's active comes with it. Six windows, one group, five undrawn — the
+    /// live shape, `group form g5 rep=#70958 members=[70958, 70949, 70956, 70953, 70951, 70944]`.
+    ///
+    /// The union itself is right for the case it was written for: geometry's candidate set excludes
+    /// minimized and size-less windows, so a member it cannot see must not be read as having left. What it
+    /// may not do is treat a window geometry just took FROM ANOTHER GROUP as a reason to annex that group.
+    func testGeometryDoesNotAnnexAnotherWindowsGroupThroughOneClaimedTab() {
+        var s = TrackedWindowState()
+        let captured = [Self.finderTabLyingAboutItsWindowActiveA, Self.finderTabLyingAboutItsWindowActiveB]
+            + Self.finderTabLyingAboutItsWindowTabsA + Self.finderTabLyingAboutItsWindowTabsB
+        s.windows = captured.enumerated().map { i, c in
+            TrackedWindow(id: "wid-\(c.wid)", wid: c.wid, pid: c.pid, title: c.title, size: c.size,
+                position: c.position, spaceIds: c.spaceIds, spaceIndexes: [], isOnAllSpaces: false,
+                spaceIsBorrowed: false, isFullscreen: false, isFullscreenMirrored: false, isMinimized: false,
+                isMainWindow: false, isWindowlessApp: false, cgsPhantomLatch: false, lastFocusOrder: i,
+                creationOrder: Int(c.wid), hasThumbnail: true)
+        }
+        s.apps[1357] = TrackedApp(state: ApplicationState(pid: 1357, bundleIdentifier: "com.apple.finder",
+            localizedName: "Finder", isHidden: false), isActive: true)
+        s.frontmostPid = 1357
+        s.visibleSpaces = [3]
+        s.currentSpaceId = 3
+        s.spaceIndexById = [3: 1]
+        // what the AX-titles path had already worked out, correctly, before geometry ran (live: g2 and g4)
+        _ = s.formGroup([Self.finderTabLyingAboutItsWindowActiveA.wid]
+            + Self.finderTabLyingAboutItsWindowTabsA.map { $0.wid },
+            representative: Self.finderTabLyingAboutItsWindowActiveA.wid, reason: "axTitles")
+        _ = s.formGroup([Self.finderTabLyingAboutItsWindowActiveB.wid]
+            + Self.finderTabLyingAboutItsWindowTabsB.map { $0.wid },
+            representative: Self.finderTabLyingAboutItsWindowActiveB.wid, reason: "axTitles")
+        XCTAssertEqual(Set(s.windows.compactMap { $0.wid.flatMap { s.groups.groupId(of: $0) } }).count, 2,
+                       "precondition: the titles path built two groups")
+        // the geometry pass, as the live capture triggered it
+        _ = WindowEventReducer.reduce(&s, .windowServerStateRead(s.windows.compactMap { w in
+            guard let wid = w.wid, let position = w.position, let size = w.size else { return nil }
+            return WsWindowSnapshot(wid: wid, position: position, size: size, isFullscreen: false,
+                isVisible: !w.spaceIds.isEmpty)
+        }))
+        let groupSizes = Dictionary(grouping: s.windows.compactMap { w -> Int? in
+            w.wid.flatMap { s.groups.groupId(of: $0) }
+        }, by: { $0 }).mapValues { $0.count }
+        XCTAssertTrue(groupSizes.values.allSatisfy { $0 <= 3 },
+                      "a group grew past either window's declared 3 tabs: \(groupSizes)")
+        let aGroup = s.groups.groupId(of: Self.finderTabLyingAboutItsWindowActiveA.wid)
+        let bGroup = s.groups.groupId(of: Self.finderTabLyingAboutItsWindowActiveB.wid)
+        XCTAssertNotEqual(aGroup, bGroup,
+                          "both windows' active tabs share a group, so one window is not drawn")
+    }
+
+    /// **rec28: two Finder windows must not fold into one group when a background tab lies about its
+    /// frame.** Live 2026-08-26 (4 reds in 8 runs). Both actives declare their own 3-tab AXTabGroup,
+    /// so no group may hold more than three of these six windows — six under one representative is two
+    /// windows merged, and five tiles the user cannot reach.
+    ///
+    /// The lie is B's background tabs reporting A's origin. Position is the only fact separating two
+    /// same-size windows, so the split cannot be rescued by tolerance: the frame belongs to another window.
+    func testAWindowIsNotAnnexedByATabLyingAboutItsFrame() {
+        let windows = [Self.finderTabLyingAboutItsWindowActiveA.tabWindow(),
+                       Self.finderTabLyingAboutItsWindowActiveB.tabWindow()]
+            + Self.finderTabLyingAboutItsWindowTabsA.map { $0.tabWindow() }
+            + Self.finderTabLyingAboutItsWindowTabsB.map { $0.tabWindow() }
+        let groups = TabGroupResolver.geometryGroups(windows)
+        for group in groups {
+            let size = Set([group.visibleWid] + group.siblingWids).count
+            XCTAssertLessThanOrEqual(size, 3,
+                "group visible#\(group.visibleWid) holds \(size) of the six windows; each active declares "
+                    + "3 tabs, so this spans two windows: \(group.siblingWids)")
+        }
+        // and specifically: the two ACTIVES may never share a group, whoever else moved
+        let actives: Set<CGWindowID> = [Self.finderTabLyingAboutItsWindowActiveA.wid,
+                                        Self.finderTabLyingAboutItsWindowActiveB.wid]
+        for group in groups {
+            let members = Set([group.visibleWid] + group.siblingWids)
+            XCTAssertNotEqual(members.intersection(actives).count, 2,
+                "both windows' active tabs landed in one group, so one window is not drawn")
         }
     }
 
@@ -530,8 +683,10 @@ final class RealWorldScenariosTests: XCTestCase {
         // marks it `isTabbed`, the exemption clears it. This coupling is why a tab-detection regression makes
         // inactive tabs vanish in #5830.
         let bg = Self.terminalMerge4Tabs[1]
-        XCTAssertTrue(PhantomWindowDetector.syncVerdict(bg.windowState(isTabbed: false), Self.terminalApp))
-        XCTAssertFalse(PhantomWindowDetector.syncVerdict(bg.windowState(isTabbed: true), Self.terminalApp))
+        XCTAssertTrue(PhantomWindowDetector.syncVerdict(bg.windowState(isTabbed: false), Self.terminalApp,
+            isOrderedIn: false, alpha: 1))
+        XCTAssertFalse(PhantomWindowDetector.syncVerdict(bg.windowState(isTabbed: true), Self.terminalApp,
+            isOrderedIn: false, alpha: 1))
     }
 
     // MARK: - Space-transition event routing (WsEventRouting)
@@ -557,7 +712,6 @@ final class RealWorldScenariosTests: XCTestCase {
         for (id, _, _) in Self.tabbedWindowMovedBetweenSpaces {
             let n = WsEventRouting.notification(id)!
             XCTAssertEqual(WsEventRouting.action(for: n), .updateSpaceMembership)
-            XCTAssertTrue(WsEventRouting.payloadCarriesSpaceId(n))
         }
     }
 
@@ -696,7 +850,7 @@ final class RealWorldScenariosTests: XCTestCase {
     /// (523,501), a SEPARATE window. GROUND TRUTH: each window belongs to AT MOST ONE group.
     ///
     /// This is the documented limitation biting hard: macOS exposes no tab→window mapping, so title is the
-    /// only key (`TabbedWindowDetection.swift`), and `matchSiblings` resolves each group INDEPENDENTLY — so two
+    /// only key, and `matchSiblings` resolves each group INDEPENDENTLY — so two
     /// groups can claim the same window behind each other's backs and no single call can see the conflict.
     static let finderDuplicateTabTitlesActiveA = CapturedWindow(pid: 779, wid: 74624, title: "Movies",
         subrole: "AXStandardWindow", size: CGSize(width: 920, height: 436), position: CGPoint(x: 324, y: 480),
@@ -753,7 +907,7 @@ final class RealWorldScenariosTests: XCTestCase {
     /// THE invariant: geometry never puts two DIFFERENT windows in one group. Two windows are different exactly
     /// when their frames differ — a tab is its parent's frame, so tabs of one window agree on it.
     ///
-    /// **With the one exception the OS forced (live QA 2026-07-30).** "Tabs of one window agree on the frame"
+    /// **With the one exception the OS forced (measured live 2026-07-30).** "Tabs of one window agree on the frame"
     /// is false after Merge All Windows: the merge never converges the tabs' frames, so a merged group spans a
     /// 29px cascade forever (`terminalMerge4Tabs`) and holding the invariant unconditionally meant no merged
     /// group could ever form. Frames may differ only where AX ITSELF accounted for every member — the visible's
@@ -1587,8 +1741,10 @@ final class RealWorldScenariosTests: XCTestCase {
     func testFinderInactiveTabIsPhantomUntilTabbed() {
         // "lwouis" is Space-less (inactive tab) → phantom before detection, exempt once `isTabbed`.
         let app = ApplicationState(pid: 779, bundleIdentifier: "com.apple.finder", localizedName: "Finder", isHidden: false)
-        XCTAssertTrue(PhantomWindowDetector.syncVerdict(Self.finderLwouisInactiveTab.windowState(isTabbed: false), app))
-        XCTAssertFalse(PhantomWindowDetector.syncVerdict(Self.finderLwouisInactiveTab.windowState(isTabbed: true), app))
+        XCTAssertTrue(PhantomWindowDetector.syncVerdict(Self.finderLwouisInactiveTab.windowState(isTabbed: false),
+            app, isOrderedIn: false, alpha: 1))
+        XCTAssertFalse(PhantomWindowDetector.syncVerdict(Self.finderLwouisInactiveTab.windowState(isTabbed: true),
+            app, isOrderedIn: false, alpha: 1))
     }
 
     // MARK: - TextEdit: distinct-title tabs + moving a tab between two groups

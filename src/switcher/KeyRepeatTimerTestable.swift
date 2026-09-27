@@ -8,6 +8,27 @@ enum KeyRepeatTimerTestable {
     /// can't get permanently wedged. A genuine safety net now — it used to be the normal path, see below.
     static let missedVisibleSignalBudget: TimeInterval = 1
 
+    /// Floor for `lateBudget`, so `defaults write -g KeyRepeat 0` (a legal value the OS reads as "no delay
+    /// between repeats") cannot turn the late-tick rule into "refuse every tick".
+    static let minimumLateBudget: TimeInterval = 0.02
+
+    /// How late a tick may reach the main thread and still count. One repeat interval: past that, the tick
+    /// the timer fired next has already superseded it.
+    static func lateBudget(_ repeatRate: TimeInterval) -> TimeInterval {
+        max(repeatRate, minimumLateBudget)
+    }
+
+    /// Stop when the shortcut is known released, by its own event or by reading the key itself.
+    ///
+    /// **The key's physical state is read because Carbon's hotkey-released event can go missing** (#6075).
+    /// While the hold modifier stays down, that event is the only thing that sets a key shortcut's state to
+    /// `.up`, so without it the timer kept cycling after a single tap, pinned the selection on the last tile
+    /// (cycling refuses to wrap while the timer runs), and every later tap was refused the same way. The read
+    /// stays true for a held key while Secure Input is on (checked with a synthetic F19 press).
+    static func shouldStop(shortcutIsUp: Bool, keyIsPhysicallyDown: Bool?, holdModifierIsReleased: Bool) -> Bool {
+        shortcutIsUp || keyIsPhysicallyDown == false || holdModifierIsReleased
+    }
+
     /// A slow show (WindowServer busy after a fullscreen/Space transition) can present the panel ~500ms after
     /// the timer was armed. The initial-delay grace must be measured from when the user could actually SEE the
     /// switcher, else repeats queued during the invisible gap fire the instant it appears and jump the
@@ -22,9 +43,18 @@ enum KeyRepeatTimerTestable {
     /// (`TilesPanel.show()` sets it as it orders the panel front). It is slightly EARLY, since the WindowServer
     /// paints after the order-front call returns, which is exactly why the visible signal stays above it rather
     /// than replacing it.
-    static func shouldApplyArtificialRepeat(now: TimeInterval, armedAt: TimeInterval,
+    ///
+    /// **`firedAt` is when the timer fired; `now` is when the main thread got to it.** The two differ whenever
+    /// the main thread is busy, and a tick that waited is not evidence that the key is still held: the key-up
+    /// that would have stopped the timer is an event source, and the run loop drains the whole main dispatch
+    /// queue before it reads the next event, so a backlog of ticks is always applied BEFORE the release that
+    /// cancels them. That is what walked the selection ~8 tiles on the first summon after a few idle minutes
+    /// (#5977): a stall after the panel was ordered front, with the grace measured from the show, made every
+    /// queued tick eligible at once.
+    static func shouldApplyArtificialRepeat(now: TimeInterval, firedAt: TimeInterval, armedAt: TimeInterval,
                                             panelBecameVisibleAt: TimeInterval?, panelShownAt: TimeInterval?,
-                                            initialDelay: TimeInterval) -> Bool {
+                                            initialDelay: TimeInterval, repeatRate: TimeInterval) -> Bool {
+        if now - firedAt >= lateBudget(repeatRate) { return false }
         if let anchor = panelBecameVisibleAt ?? panelShownAt {
             return now - anchor >= initialDelay
         }

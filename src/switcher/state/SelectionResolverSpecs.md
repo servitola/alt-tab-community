@@ -2,6 +2,17 @@
 
 > **Line coverage:** `SelectionResolver.swift` 93% · _refreshed 2026-05-27 by `/coverage-explore`_
 
+## Where the hover highlight goes when the list changes (`reanchorHover`)
+
+- a list refresh leaves the hover alone; only the user dismisses it (keyboard selection, pointer leaving the tiles),
+  and a dismissed hover stays dismissed until the pointer moves
+- the hover follows the WINDOW it was on, not the position it occupied
+- a window inserted or removed before it moves its index, and the highlight moves with the window
+- a window that left the list takes its highlight with it: hover is cleared, never inherited by whoever
+  took the slot
+- no hover means no hover; there is nothing to re-anchor
+
+
 ## Summary
 
 `SelectionResolver` decides **which tile is highlighted** while the switcher is open. Every time the
@@ -16,6 +27,19 @@ Once the user moves the highlight, the selected window's id is remembered as the
 refresh the resolver tries to keep the highlight on that same window even as the list reorders — this is
 the #5665 fix (before it, a background app finishing launch could yank the highlight away mid-pick).
 
+### Actions before a deferred repaint
+
+`Windows.selectedWindow()` resolves the selected identity before focusing, closing, minimizing, hiding,
+quitting, or displaying Preview. Its cached index is a fast path only while it still names that identity.
+Removing a preceding window, inserting a window, or reordering the list cannot redirect an action to a
+neighbor while the repaint is pending. A missing or no-longer-visible target yields no action. The next
+selection refresh chooses a visible replacement and updates the target even when its index is unchanged.
+
+Regression tests cover removals with both valid and out-of-range stale indices, insertion/reordering,
+missing targets, and invalid indices without a target. `CoalescedWorkTests` also resolves the selection
+while the production `RepaintCoalescer` holds the removal repaint. Live QA `F-10` closes a real background
+window, releases the shortcut before repaint, and checks the window macOS actually focused.
+
 ## Behavior & edge cases (decision priority order)
 
 1. **Search-clear** (`restoreDefaultOnSearchClear`) takes precedence — re-runs the initial pick even with no visible windows.
@@ -23,11 +47,17 @@ the #5665 fix (before it, a background app finishing launch could yank the highl
 3. **Search best-match** (`bestMatchOnSearchChange`) → jump to the first visible (best-scored) window.
 4. **No target yet** (`selectedTarget == nil`, first refresh) → "from scratch" initial pick.
 5. **Target still present** → follow it to its new index (`selectAt`).
-6. **Target gone** → adapt to the closest visible window.
+6. **Target gone after a shortcut action** (close, minimize, hide, quit, fullscreen) → the heir recorded at the
+   press: after closing a native tab, a sibling tab that was hidden (the same window, now drawn by another
+   tab); then the next drawn window, then the previous ones. Closing the frontmost window `[A1, A2, B]` makes
+   the app focus A2, before or after the removal lands: focus first used to end on B, removal first on A2.
+   Deciding from the list at the press ends on A2 either way. Any selection move by the user drops it.
+7. **Target gone** otherwise → adapt to the closest visible window.
 
 `selectedTarget` means two different things, split by `userPickedSelection`: while the user hasn't moved the
 selection it is merely where the DEFAULT landed, so step 4 re-derives it on every refresh; once the user
-cycles or hovers it is a commitment and step 5 follows THAT window by id however the list reorders (#5665).
+cycles horizontally or vertically, or hovers, it is a commitment and step 5 follows THAT window by id however
+the list reorders (#5665). A successful vertical move records that commitment before updating the selected index.
 Conflating them was a bug: the switcher opens while the window set is still settling (tabs grouping, Spaces
 settling), so the default locked onto whatever occupied the slot mid-churn and then trailed that window across
 the list as things resolved — the highlight ending up on an unrelated tile.
@@ -48,10 +78,18 @@ tile past what the user asked for: alt-tab hands them a window they never chose,
 never comes back (#5941). `SelectionInputs.currentWindowIsDrawn` carries the answer; when it is false the
 pick is the FIRST drawn tile as of the summon rather than the second, and every other rule is untouched.
 
-The shell answers that question of the APP — "does some drawn tile belong to the frontmost app" — not of the
-window. The strict question ("is the frontmost app's focused window drawn") reads `application.focusedWindow`,
-which can be stale or nil, and answering it wrongly puts the default on the window the user is already
-looking at. The app-level question can only be false when the current window is genuinely absent.
+`SelectionResolver.currentWindowIsDrawn` answers it of the APP — "is a window of the frontmost app that
+could BE the current one being kept out of the list" — not of the window. The strict question ("is the
+frontmost app's focused window drawn") reads `application.focusedWindow`, which can be stale or nil, and
+answering it wrongly puts the default on the window the user is already looking at.
+
+Only windows that cannot be the one on screen are skipped: a windowless placeholder, a phantom, a minimized
+window. An app owning nothing else is not having anything hidden from the user, so the ordinary rule applies.
+Reading it as "does some drawn tile belong to the frontmost app" was #5960: closing the last window of the
+frontmost app leaves it running and still frontmost with only a placeholder, `Windowless apps: Hide` drops
+that, and the pick stopped stepping over a front tile that was the very window on top of the screen — alt-tab
+handed the user the window they were already looking at, and the two-window toggle took two presses to start.
+An app left with only minimized windows under `Minimized windows: Hide` had the same shape.
 
 That makes the answer exact for the filters that drop a whole app (`Non-active apps`, an Exceptions rule) and
 deliberately coarse for the two that can drop the current window while a SIBLING window of the same app stays
@@ -83,8 +121,8 @@ so no event can land in between.
 ## Test scenarios
 
 Mirrors `SelectionResolverTests.swift` 1:1. Groups: A initial pick · B preserve target (#5665) ·
-C target removed · D search mode · E edge cases · F current window not drawn (#5941) · plus direct
-helper-kernel checks.
+C target removed · D search mode · E edge cases · F current window not drawn (#5941) · G answering that
+question from the frontmost app's windows (#5960) · plus direct helper-kernel checks.
 
 ### A. Initial pick (`selectedTarget == nil`)
 - **testInitialPickEmptyList** — no windows → `clearTargetAndHover`.
@@ -106,15 +144,22 @@ helper-kernel checks.
 ### C. Target removed / no longer visible
 - **testTargetRemovedAdaptToClosestBelow** — target closed; backfill the target to the window now at that index.
 - **testTargetRemovedSelectedIndexOutOfBounds** — list shrank below `selectedIndex` → closest visible below.
-- **testTargetBecameInvisible** — target filtered out (search/space) → closest visible below.
+- **testTargetBecameInvisible** — target filtered out (search or space; same path either way) → closest visible below.
 - **testTargetRemovedAndListEmptied** — nothing left → `clearTargetAndHover`.
 - **testTargetRemovedOnlyOneLeft** — one window remains → select it and backfill the target.
+- **testActionHeirIsTheSameWhicheverOrderFocusAndRemovalArrive** — closing a window whose app focuses the
+  next one lands on that window, whether the focus bump or the removal arrives first.
+- **testActionHeirPrefersTheTabSiblingThatTookTheTile** — closing a native tab selects its window, now drawn by a
+  tab that was hidden, wherever it sorts.
+- **testActionHeirIgnoresTabSiblingsThatWereAlreadyDrawn** — with tabs as separate windows, the next window inherits.
+- **testActionHeirSkipsNeighborsThatLeftToo** — quitting an app skips its other windows.
+- **testActionHeirFallsBackToTheNearestPrecedingWindow** — nothing after the target → nearest window before it.
+- **testActionHeirIgnoredForAnotherTarget** — a fallback recorded for another window is not used.
 
 ### D. Search-mode interactions
 - **testSearchBestMatchOnSearchChange** — new query produces a best match → jump to first visible.
 - **testSearchRestoreDefaultOnClear** — cleared query → restore the default initial pick.
 - **testTargetPreservedInSearchMode** — target preservation works the same with search active.
-- **testSearchTargetFilteredOutWithOthersMatching** — target filtered but others match → adapt to closest.
 
 ### E. Edge cases
 - **testEdgeSingleWindowBecomesInvisible** — the only window goes invisible → clear selection.
@@ -146,6 +191,33 @@ helper-kernel checks.
 - **testInitialPickTopTwoMinimizedIsUnaffectedByTheFlag** — the both-top-minimized edge never stepped over
   anything, and still doesn't.
 
+### G. Answering `currentWindowIsDrawn` from the frontmost app's windows (#5960)
+
+An exact attention identity is used only while that window can still be the drawn front window. A minimized,
+phantom, windowless, or background-tab identity is stale by construction; the shell then answers from the
+frontmost application's viable windows. This covers the handoff after minimizing the exact window and the brief
+tab-switch interval where attention still names the outgoing background tab.
+- **testCurrentWindowIsDrawnIsFalseWhenARealWindowIsFilteredOut** — the #5941 case the flag exists for.
+- **testCurrentWindowIsDrawnIsTrueWhenTheRealWindowIsDrawn** — its control.
+- **testCurrentWindowIsDrawnIsTrueWhenOnlySomeWindowsAreFilteredOut** — one tile of the app is drawn.
+- **testCurrentWindowIsDrawnIsTrueForAWindowlessFrontmostApp** — #5960: the last window was closed and
+  `Windowless apps: Hide` drops the placeholder; nothing of theirs is hidden, so the front tile is stepped over.
+- **testCurrentWindowIsDrawnIsTrueForADrawnWindowlessPlaceholder** — the same app with the placeholder shown.
+- **testCurrentWindowIsDrawnIsTrueWhenOnlyMinimizedWindowsAreHidden** — a minimized window is not one the
+  user can be looking at.
+- **testCurrentWindowIsDrawnIsTrueWhenTheOnlyWindowIsADrawnMinimizedOne** — the answer does not depend on the
+  minimized filter either way.
+- **testCurrentWindowIsDrawnIsTrueWhenTheOnlyWindowIsPhantom** — a window we say does not exist cannot be the
+  one being hidden.
+- **testCurrentWindowIsDrawnIsFalseWhenAPlaceholderAccompaniesAFilteredOutWindow** — the real window still
+  answers.
+- **testCurrentWindowIsDrawnIsTrueWhenTheAppHasNoWindows** — nothing tracked for the frontmost app.
+- **testExactAttentionAnswersForTheWindowRatherThanItsApplication** — when attention identifies the current
+  window, its own filter result decides even if a sibling from the same app remains drawn.
+- **testUnknownAttentionPreservesTheOrdinaryRule** — missing evidence never becomes evidence of absence.
+- **testInitialPickStepsOverTheFrontTileAfterTheFrontmostAppLostItsLastWindow** — #5960 through both kernels,
+  on the reporter's own steps: the pick lands on the second tile, not the window already on screen.
+
 ### Helper kernels (direct)
 - **testGetLastFocusedOrderWindowIndexIgnoresWindowlessAndInvisible** — scan ignores windowless + invisible.
 - **testInitialPickStepsOverWindowThatAppearedAfterSummon** — a window focused behind the switcher takes slot 0;
@@ -170,5 +242,7 @@ helper-kernel checks.
 - **testFindTargetSkipsInvisibleMatches** — finds visible id; nil for invisible/missing/nil id.
 - **testDefaultSelectionRetracksModelUntilUserPicks** — an untouched default re-derives as the model settles.
 - **testUserPickedTargetIsFollowedNotRederived** — the same target, once the USER chose it, is followed (#5665).
+- **testVerticalNavigationCommitsTheUserPickBeforeMovingSelection** — a successful up/down move records user
+  intent before changing the selected index, so an immediate model refresh follows the chosen window.
 - **testDefaultDoesNotTrailAWindowThatSlidDownTheList** — the captured failure: the default locked onto a
   window that then slid down the list, dragging the highlight to a nonsense slot.

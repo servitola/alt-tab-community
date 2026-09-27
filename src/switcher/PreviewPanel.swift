@@ -13,19 +13,11 @@ class PreviewPanel: NSPanel {
 
     convenience init() {
         self.init(contentRect: .zero, styleMask: [.nonactivatingPanel, .titled, .fullSizeContentView], backing: .buffered, defer: false)
-        isFloatingPanel = true
-        animationBehavior = .none
-        hidesOnDeactivate = false
-        titleVisibility = .hidden
+        applyFloatingPanelChrome()
         titlebarAppearsTransparent = true
-        backgroundColor = .clear
         contentView = Self.previewView
         Self.borderView.autoresizingMask = [.width, .height]
         Self.previewView.addSubview(Self.borderView)
-        // triggering AltTab before or during Space transition animation brings the window on the Space post-transition
-        collectionBehavior = .canJoinAllSpaces
-        // helps filter out this window from the thumbnails
-        setAccessibilitySubrole(.unknown)
         Self.shared = self
     }
 
@@ -86,6 +78,7 @@ class PreviewPanel: NSPanel {
         // Always use the primary screen as reference since all coordinates are relative to it
         frame.origin.y = NSScreen.screens.first!.frame.maxY - frame.maxY
         Self.shared.setFrame(frame, display: false)
+        SearchDiscoveryHint.shared.refreshAfterVisibleWork()
     }
 }
 

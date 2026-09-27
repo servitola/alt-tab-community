@@ -30,12 +30,12 @@ order and unroll the free pairs as input states (see the "Race interleavings" se
   2026-07-30**: the original recording put all four at ONE position (683,101), which the OS does not produce —
   a merge never converges the tabs' frames. The merged window is a brand-new wid one cascade step past the
   windows it absorbed, and those keep their positions, frozen, so the group spans four origins 29px apart and
-  only the SIZE is shared. Re-measured from the live QA run (T-04 Terminal, `757x543@942,277 / @913,248 /
-  @884,219 / @855,190`, active first; T-03 Finder is the same shape at 920×436) and mapped onto this capture's
+  only the SIZE is shared. Re-measured live (Terminal, `757x543@942,277 / @913,248 /
+  @884,219 / @855,190`, active first; Finder is the same shape at 920×436) and mapped onto this capture's
   wids in the same MRU order. The single position is why every kernel test here passed while both live merges
   formed NO group: the cascade is exactly what `framePartitions` splits on.
-- **`finderTabDraggedOutStillClaimsThreeTabs`** — Finder, Window ▸ Move Tab to New Window (live QA
-  2026-07-30, T-05). The torn-out window at (290,712) still reports the 3 tabs it had as the group's active,
+- **`finderTabDraggedOutStillClaimsThreeTabs`** — Finder, Window ▸ Move Tab to New Window (measured live
+  2026-07-30). The torn-out window at (290,712) still reports the 3 tabs it had as the group's active,
   beside the group it left at (1116,683). The capture of a stale `tabCount`.
 - **`terminalActive9Titles` / `terminal9TabsTracked`** — mid-creation of a 9-tab group: active reports 9 `~`,
   only 5 background siblings tracked yet (3 tabs not yet discovered).
@@ -50,7 +50,7 @@ order and unroll the free pairs as input states (see the "Race interleavings" se
 - **`dragOut*`** — "Move Tab to New Window": the leaving tab shrinks 757×543 → 757×527 (tab bar gone) and goes
   standalone; the 3 survivors stay 757×543. Pre-drag group `[30238, 30236, 30231, 30230]`.
 - **`finderGitActive` / `finderLwouisInactiveTab` / `finderMoviesStandalone`** — the maintainer's recorded
-  Finder case (see `experimentations/TabbedWindowDetection.swift`): tabs "lwouis"(inactive)/"git"(active) +
+  Finder case: tabs "lwouis"(inactive)/"git"(active) +
   a same-app standalone "Movies". Distinct titles, so a clean unambiguous match.
 - **`tabbedWindowMovedBetweenSpaces`** — a tabbed window changing Space: 1326 (leave old) + 1325 (join new),
   each carrying (spaceId, wid). The events that fire reconcile so the group follows the move.
@@ -58,7 +58,7 @@ order and unroll the free pairs as input states (see the "Race interleavings" se
   Reference only: MC has no pure-kernel consumer and moves no window between Spaces (it orders thumbnails in/out);
   the ids it fires (818, 1327, 1328) are intentionally not routed. `AXExposeExit` is the clean end-of-transition hook.
 
-## 2026-07-14/15 captures (the rec8–rec13 QA rounds)
+## 2026-07-14/15 captures (the rec8–rec13 rounds)
 
 - **`terminalLiveGroupActive` / `BackgroundTab`** — a live 2-tab group whose ACTIVE transiently reported a nil
   AXTabGroup. A nil read is routine churn; it must never dissolve a group.
@@ -196,7 +196,7 @@ coarser layer.
 ## Test scenarios
 
 - **testMergedTabsGroupByGeometry** — merged group ⇒ `geometryGroups` groups the 3 Space-less tabs under the active.
-- **testADraggedOutWindowIsNotFoldedBackByAStaleTabCount** — T-05 live: the torn-out window, its drag-out
+- **testADraggedOutWindowIsNotFoldedBackByAStaleTabCount** — live: the torn-out window, its drag-out
   already confirmed, was folded straight back by geometry because a BACKGROUND member's stale `tabCount`
   accounted for the cluster while the genuine on-screen member read a smaller count. Teeth-verified, and note
   it only bites with the live fact that the AX read had re-formed the real group in the same dispatch — the
@@ -205,6 +205,12 @@ coarser layer.
   link (the title path can't make one — same title, four different positions), so geometry was the only path and
   it formed no cluster at all. 4 windows, 0 groups, 3 hidden as phantoms. The AXTabGroup count accounts for
   every member, which is what may override the cascade (`tabCountAccountsForEveryMember`).
+- **testASecondWindowsActiveTabIsNotSweptInByACountItAlsoDeclares** — the other side of that override: two
+  same-size Finder windows with 3 tabs each, the top one mid tab-switch. Its outgoing active is Space-less for
+  the handover, so the bottom window is the cluster's only genuine Space holder and its declared 3 matches the
+  3 members — but one of them is the TOP window's active tab, which reports an AXTabGroup of its own from
+  another position. The count is a coincidence there, not an account, and waiving the position split handed one
+  window's active to the other's group (measured live, 2026-09-10).
 - **testSeparateWindowsNeverGroup** — separate windows (incl. a flaky Space-less read) ⇒ no group (the gate holds).
 - **testMergedTabsMatchByTitleOnlyOnceGeometryHasLinkedThem** — the title path cannot bootstrap a merged group
   and must not be taught to: four distinct cascade positions with one shared title is rec11's exact shape, where
@@ -273,6 +279,11 @@ coarser layer.
   backgrounding INSIDE window B is not adoptable by a same-size unrelated window (a live group — one whose
   own member still holds a Space — is never orphaned; `isOrphanedTab`).
 - **testWindowLinkedOnlyToItselfConfirmsNoTabCluster** — rec8's seed: a self-only link confirms no cluster.
+- **testASwitchingWindowIsNotFoldedIntoTheNeighbourItOutranksInMru** — live 2026-08-02: a tab switch in the
+  FRONT Finder window let the OTHER Finder window's cluster claim it, so a tile stopped being drawn and the
+  summon 15ms later offered four tiles instead of five. MRU is what refuses the fold — a group's active tab
+  is its most recently focused member by definition, so a window that outranks the candidate representative
+  cannot be one of its background tabs. The neighbour's own group must still form.
 - **testCascadedWindowTabsAreNotClaimedAcrossWindows** / **testGeometryDoesNotClusterCascadedWindowsOfTheSameApp**
   — rec11/rec12: the 29px cascade collision, closed on BOTH claim paths (titles: exact-position match;
   geometry: `framePartitions`).

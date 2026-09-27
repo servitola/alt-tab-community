@@ -1,15 +1,23 @@
 protocol EffectView: NSView {
-    func updateAppearance()
+    func updateAppearance(cornerRadius: CGFloat)
     /// Where `TilesView` places its content (scroll view, search field, empty-state label).
     /// For `NSVisualEffectView` that's the view itself; for `NSGlassEffectView` it's `contentView`,
     /// the only place Apple guarantees rendering for embedded views.
     var hostView: NSView { get }
 }
 
+extension EffectView {
+    func updateAppearance() { updateAppearance(cornerRadius: Appearance.windowCornerRadius) }
+}
+
 @available(macOS 26.0, *)
 extension NSGlassEffectView: EffectView {
-    func updateAppearance() {
-        cornerRadius = Appearance.windowCornerRadius
+    func updateAppearance(cornerRadius: CGFloat) {
+        self.cornerRadius = cornerRadius
+        // Left rectangular, the clip set in `makeGlassEffectView` draws a straight outline outside the
+        // glass shape on macOS 27 (#5757). Set here, not there: cached views are reused across style
+        // and size changes.
+        layer!.cornerRadius = cornerRadius
     }
 
     var hostView: NSView { contentView! }
@@ -26,9 +34,9 @@ class FrostedGlassEffectView: NSVisualEffectView, EffectView {
         updateAppearance()
     }
 
-    func updateAppearance() {
+    func updateAppearance(cornerRadius: CGFloat) {
         material = Appearance.material
-        updateRoundedCorners(Appearance.windowCornerRadius)
+        updateRoundedCorners(cornerRadius)
     }
 
     /// using layer!.cornerRadius works but the corners are aliased; this custom approach gives smooth rounded corners
@@ -100,10 +108,12 @@ private func makeGlassEffectView(clear: Bool) -> NSGlassEffectView {
     // NSGlassEffectView only renders views embedded in `contentView`; this single host holds the
     // scroll view, search field and empty-state label so they all sit inside the glass.
     glass.contentView = NSView()
-    glass.updateAppearance()
     // without this, there are weird shadows around the corners (most visible with .regular glass)
     glass.wantsLayer = true
     glass.layer!.masksToBounds = true
+    glass.layer!.cornerCurve = .continuous
+    // after the layer exists: `updateAppearance` rounds the clip through it
+    glass.updateAppearance()
     return glass
 }
 

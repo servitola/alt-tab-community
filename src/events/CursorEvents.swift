@@ -6,16 +6,13 @@ class CursorEvents {
     private static var shouldBeEnabled: Bool!
     private static var mouseDownTarget: AnyObject?
     private static var mouseDownInsideSearchField = false
+    private static var searchHintClick = SearchDiscoveryPolicy.Click()
     /// true once the tap has observed a leftMouseDown since the switcher showed (reset per gesture and on
     /// each show). A drag from another app started before the switcher showed, so its down was never seen —
     /// that is how `handleLeftMouseUp` recognizes a drop's up and yields it (see `DragAndDropResolver`).
     private static var sawLeftMouseDown = false
     static var deadZoneInitialPosition: CGPoint?
     static var isAllowedToMouseHover = true
-
-    static func observe() {
-        observe_()
-    }
 
     static func toggle(_ enabled: Bool) {
         guard enabled != shouldBeEnabled else { return }
@@ -24,6 +21,7 @@ class CursorEvents {
             deadZoneInitialPosition = nil
         } else {
             sawLeftMouseDown = false // fresh session: a drag in flight when we show has no down we saw
+            searchHintClick = SearchDiscoveryPolicy.Click()
         }
         if let eventTap {
             CGEvent.tapEnable(tap: eventTap, enable: enabled)
@@ -31,28 +29,22 @@ class CursorEvents {
     }
 
     static func reEnableTapIfNeeded() {
-        guard let eventTap, shouldBeEnabled, !CGEvent.tapIsEnabled(tap: eventTap) else { return }
-        CGEvent.tapEnable(tap: eventTap, enable: true)
-        Logger.warning { "" }
+        if CGEvent.reEnableTapIfNeeded(eventTap, wanted: shouldBeEnabled) {
+            Logger.warning { "" }
+        }
     }
 
-    private static func observe_() {
+    static func observe() {
         let eventMask = [CGEventType.leftMouseDown, CGEventType.leftMouseUp, CGEventType.rightMouseDown, CGEventType.rightMouseUp, CGEventType.otherMouseDown, CGEventType.otherMouseUp, CGEventType.mouseMoved].reduce(CGEventMask(0), { $0 | (1 << $1.rawValue) })
-        // CGEvent.tapCreate returns nil if ensureAccessibilityCheckboxIsChecked() didn't pass
-        eventTap = CGEvent.tapCreate(
+        eventTap = CGEvent.createTapOrRestart(
             tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
             options: .defaultTap,
             eventsOfInterest: eventMask,
             callback: handleEvent,
-            userInfo: nil)
-        if let eventTap {
-            toggle(false)
-            let runLoopSource = CFMachPortCreateRunLoopSource(nil, eventTap, 0)
             // we run on main-thread directly since all we do is check NSEvent and UI coordinates, which we must do on main-thread
-            CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
-        } else {
-            App.restart()
+            runLoop: CFRunLoopGetMain())
+        if eventTap != nil {
+            toggle(false)
         }
     }
 
@@ -74,6 +66,11 @@ class CursorEvents {
 
     private static func handleLeftMouseDown(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
         sawLeftMouseDown = true // this gesture's down is ours; its up is a click, not a foreign drop
+        if searchHintClick.begin(inside: SearchDiscoveryHint.shared.containsMouseLocation) {
+            mouseDownTarget = nil
+            mouseDownInsideSearchField = false
+            return Unmanaged.passUnretained(cgEvent)
+        }
         if TilesView.hasMarkedText() || ContextMenuEvents.isMenuOpen { return Unmanaged.passUnretained(cgEvent) }
         if isPointerInsideSearchField() {
             mouseDownInsideSearchField = true
@@ -88,6 +85,10 @@ class CursorEvents {
     private static func handleLeftMouseUp(_ cgEvent: CGEvent) -> Unmanaged<CGEvent>? {
         let sawDown = sawLeftMouseDown
         sawLeftMouseDown = false
+        if searchHintClick.end(inside: SearchDiscoveryHint.shared.containsMouseLocation) {
+            mouseDownTarget = nil
+            return Unmanaged.passUnretained(cgEvent)
+        }
         // a drag from another app ends with a leftMouseUp whose matching down we never saw (it happened
         // before the switcher showed). Don't swallow it, or the drop never concludes and the file stays
         // stuck on the cursor — whether released on a tile, the padding around the tiles, or outside the

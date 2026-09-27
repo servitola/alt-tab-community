@@ -2,7 +2,7 @@ import CoreGraphics
 import Foundation
 
 /// Replays a transcribed debug-log recording against the pure `WindowEventReducer`, so an adapter-layer
-/// regression becomes a failing unit test instead of a live QA session. A fixture is an initial
+/// regression becomes a failing unit test instead of a live session. A fixture is an initial
 /// `TrackedWindowState` plus a sequence of steps; after EVERY step the harness checks the cross-cutting invariants
 /// the recordings kept violating one path at a time (one tile per group, no cross-frame group, the focused
 /// window shown, no on-Space window claimed, Space-less strays hidden, focus picks the representative).
@@ -144,19 +144,23 @@ final class TestReducerRunner {
         switch effect {
         case .removeWindow(let wid):
             removeWindowTwin(wid)
-        case .scheduleHoldReleaseCheck, .scheduleDragOutCheck:
+        case .scheduleHoldReleaseCheck, .scheduleDragOutCheck, .scheduleStandaloneTabCheck:
             pendingTimers.append(effect)
         case .discoverWindow, .probeWindowLiveness, .readTitleAndTabs, .queryWindowServerState,
-             .discoverInactiveTabs, .refreshSpacesTopology, .refreshSpacesTopologyAndSync:
+             .discoverInactiveTabs, .reconcileAxElementEnd,
+             .refreshSpacesTopology, .refreshSpacesTopologyAndSync:
             pendingRequests.append(effect)
         case .log(let line):
             trace.append("[\(stepIndex)] \(line)")
         case .refreshUi(let wids, let onlyWhileSwitcherOpen):
             refreshes.append((wids, onlyWhileSwitcherOpen))
+        case .refreshUiImmediately(let wids):
+            refreshes.append((wids, false))
         case .deferCaptureUntilRestoreEnds(let wid):
             deferredCaptures.append(wid)
         case .copyThumbnail, .applyFocus, .updateScreenId, .removeWindowlessPlaceholder,
-             .addWindowlessPlaceholder, .bumpFocusViaAxBackstop, .checkShortcutsForFocusedWindow:
+             .addWindowlessPlaceholder, .readFocusedWindowOnActivation,
+             .checkShortcutsForFocusedWindow, .retireSurface:
             break  // display/AppKit-side; no model content beyond what the reducer already wrote
         }
     }
@@ -189,6 +193,10 @@ final class TestReducerRunner {
             if let i = pendingTimers.firstIndex(where: {
                 if case .scheduleDragOutCheck(let w, _, _) = $0 { return w == wid } else { return false }
             }) { pendingTimers.remove(at: i) }
+        case .standaloneTabCheck(let wid, _, _):
+            if let i = pendingTimers.firstIndex(where: {
+                if case .scheduleStandaloneTabCheck(let w, _, _) = $0 { return w == wid } else { return false }
+            }) { pendingTimers.remove(at: i) }
         default:
             break
         }
@@ -202,7 +210,7 @@ final class TestReducerRunner {
     private func inputTime(_ input: ReducerInput) -> TimeInterval? {
         switch input {
         case .windowCreated(_, let now, _), .windowOrderedIn(_, let now, _),
-             .windowFocused(_, let now), .appActivated(_, let now, _),
+             .windowFocused(_, let now), .appActivated(_, let now),
              .spaceMembershipChanged(_, _, _, let now, _):
             return now
         default:
@@ -317,6 +325,9 @@ final class TestReducerRunner {
             if wids.contains(where: { wid in pendingTimers.contains {
                 if case .scheduleDragOutCheck(let w, _, _) = $0 { return w == wid } else { return false }
             } }) { continue }
+            if wids.contains(where: { wid in pendingTimers.contains {
+                if case .scheduleStandaloneTabCheck(let w, _, _) = $0 { return w == wid } else { return false }
+            } }) { continue }
             // The OS confirmed a tab group here, so this membership is evidence rather than a guess.
             let osConfirmedTabs = members.contains { $0.tabCount > 1 }
             let frames = members.compactMap { w -> String? in
@@ -351,14 +362,19 @@ final class TestReducerRunner {
     /// A real on-Space window is never claimed as a tab: tabbed ⇒ its Space is empty, borrowed, or the hold
     /// says it's mid-swap. Two sanctioned transitional shapes are exempt: a window creation in flight — the
     /// count-driven atomic claim DELIBERATELY claims the old active whose 1326 hasn't landed (the creation
-    /// race, `terminalNewTab*`) — and a rep swap with an in-flight drag-out verdict, where the OUTGOING
-    /// representative keeps its genuine Space for the few ms until its own 1326 lands (rec19's switch shape).
+    /// race, `terminalNewTab*`) — and a rep swap with an in-flight drag-out or standalone-split verdict,
+    /// where two members temporarily carry genuine on-screen evidence.
     private func checkRealOnSpaceWindowNeverClaimed(_ context: String) {
         guard state.recentlyCreated.isEmpty else { return }
         for w in state.windows where state.isTabbed(w) {
             guard let wid = w.wid else { continue }
             if pendingTimers.contains(where: {
                 if case .scheduleDragOutCheck(_, let prev, _) = $0 { return prev == wid } else { return false }
+            }) { continue }
+            if pendingTimers.contains(where: {
+                if case .scheduleStandaloneTabCheck(let w, let sibling, _) = $0 {
+                    return w == wid || sibling == wid
+                } else { return false }
             }) { continue }
             if !w.spaceIds.isEmpty && !w.spaceIsBorrowed && !state.held.contains(wid) {
                 violation(context, "window \(w.id) holds a GENUINE Space \(w.spaceIds) yet is claimed as a tab")

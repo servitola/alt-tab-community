@@ -328,7 +328,7 @@ class PreferencesMigrations {
                     }
                 }
             }
-            throw AxError.runtimeError // remove compiler warning
+            throw MigrationControlFlow.done // remove compiler warning
         } catch {
             // the LSSharedFile API is deprecated, and has a runtime crash on M1 Monterey
             // we catch any exception to void the app crashing
@@ -382,7 +382,6 @@ class PreferencesMigrations {
     }
 
     static func migrateDropdownsFromTextToIndexes() {
-        migratePreferenceValue("theme", [" macOS": "0", "❖ Windows 10": "1"])
         // "Main screen" was renamed to "Active screen"
         migratePreferenceValue("showOnScreen", ["Main screen": "0", "Active screen": "0", "Screen including mouse": "1"])
         migratePreferenceValue("appsToShow", ["All apps": "0", "Active app": "1"])
@@ -404,44 +403,6 @@ class PreferencesMigrations {
             Self.defaults.set(new, forKey: preference)
         }
     }
-
-    static func migrateShortcutPreferencesToSecureCoding() {
-        Preferences.allShortcutPreferenceKeys.forEach {
-            let key = $0
-            guard let oldValue = Self.defaults.object(forKey: key) else { return }
-            if let oldStorage = oldValue as? [String: Any] {
-                let (isValid, shortcut) = Preferences.decodeShortcutStorage(oldStorage)
-                guard isValid else {
-                    Self.defaults.removeObject(forKey: key)
-                    return
-                }
-                Self.defaults.set(Preferences.shortcutStorage(shortcut, oldStorage["string"] as? String), forKey: key)
-                return
-            }
-            if let oldDataValue = oldValue as? Data {
-                let (isValid, shortcut) = Preferences.unarchiveShortcut(oldDataValue)
-                guard isValid else {
-                    Self.defaults.removeObject(forKey: key)
-                    return
-                }
-                Self.defaults.set(Preferences.shortcutStorage(shortcut, nil), forKey: key)
-                return
-            }
-            guard let oldStringValue = oldValue as? String else {
-                Self.defaults.removeObject(forKey: key)
-                return
-            }
-            if oldStringValue.isEmpty {
-                Self.defaults.set(Preferences.shortcutStorage(nil, ""), forKey: key)
-                return
-            }
-            guard let migratedShortcut = Preferences.shortcutFromKeyEquivalent(oldStringValue) else {
-                Self.defaults.removeObject(forKey: key)
-                return
-            }
-            Self.defaults.set(Preferences.shortcutStorage(migratedShortcut, oldStringValue), forKey: key)
-        }
-    }
 }
 
 /// workaround to silence compiler warning
@@ -450,3 +411,10 @@ private protocol AvoidDeprecationWarnings {
 }
 
 extension PreferencesMigrations: AvoidDeprecationWarnings {}
+
+/// Not a failure: the login-item cleanup above ends with a throw purely to satisfy the compiler, and the
+/// surrounding `catch` exists to swallow the deprecated LSSharedFile API's M1 Monterey crash. Its own type,
+/// so it cannot be mistaken for an Accessibility error (it used to borrow `AxError`).
+enum MigrationControlFlow: Error {
+    case done
+}

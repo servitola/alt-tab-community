@@ -1,11 +1,11 @@
 import XCTest
 
 /// Pins `BruteForceWindowMatch.isTargetWindowRoot` — the decision extracted from
-/// `AXUIElement.windowByBruteForce`. Pure data in, `Bool` out: no AX, no IPC, no globals.
+/// `AXUIElement.windowsByBruteForce`. Pure data in, `Bool` out: no AX, no IPC, no globals.
 ///
 /// The #5849 regression: `_AXUIElementGetWindow` returns the containing window's id for a window's
 /// DESCENDANTS too, so a brute-force scan that stopped at the first wid match returned a descendant
-/// (`AXOutline` / `AXMenuButton` / `AXGroup`) instead of the `AXWindow` root, and the discriminator
+/// (`AXOutline` / `AXMenuButton` / `AXGroup`) instead of the `AXWindow` root, and admission
 /// dropped the window entirely. These tests guarantee only the `AXWindow` root for the target wid is
 /// accepted, so a descendant sharing the wid can never win the scan again.
 final class BruteForceWindowMatchTests: XCTestCase {
@@ -71,15 +71,40 @@ final class BruteForceWindowMatchTests: XCTestCase {
         XCTAssertEqual(picked, 1, "the scan must skip the earlier AXOutline and select the AXWindow root")
     }
 
-    // MARK: - E. Whose tab is it? (the 2026-08-01 cross-window adoption)
+    // MARK: - E. One traversal can collect several target roots
 
-    /// The two Finder windows of the QA capture: parked 520pt apart, every tab titled "lwouis".
+    func testBatchCollectsEveryRequestedRootWithoutAcceptingDescendants() {
+        let requested: Set<CGWindowID> = [Self.targetWid, Self.otherWid]
+        let candidates: [(wid: CGWindowID?, role: String?)] = [
+            (Self.targetWid, kAXOutlineRole),
+            (Self.targetWid, kAXWindowRole),
+            (777, kAXWindowRole),
+            (Self.otherWid, kAXGroupRole),
+            (Self.otherWid, kAXWindowRole),
+        ]
+        var remaining = requested
+        for candidate in candidates {
+            guard let wid = candidate.wid, remaining.contains(wid),
+                  BruteForceWindowMatch.isTargetWindowRoot(
+                    candidateWid: wid, candidateRole: candidate.role, targetWid: wid) else { continue }
+            remaining.remove(wid)
+        }
+        XCTAssertTrue(remaining.isEmpty, "one traversal must collect both roots and ignore their earlier descendants")
+    }
+
+    // MARK: - F. Whose tab is it? (the 2026-08-01 cross-window adoption)
+
+    /// The two Finder windows of the capture: parked 520pt apart, every tab titled "lwouis".
     private static let requester = CGRect(x: 80, y: 80, width: 1000, height: 440)
     private static let otherWindow = CGRect(x: 80, y: 600, width: 1000, height: 440)
 
+    /// The candidate's own wid, distinct from `otherWid` — the gate must never reject it against itself.
+    private static let candidateWid: CGWindowID = 12345
+
     func testAdoptsATabParkedOnTheRequester() {
         XCTAssertTrue(BruteForceWindowMatch.isPlausibleInactiveTab(
-            candidate: Self.requester, requester: Self.requester, otherWindowsOfApp: [Self.otherWindow]))
+            candidateWid: Self.candidateWid, candidate: Self.requester, requester: Self.requester,
+            otherWindowsOfApp: [(Self.otherWid, Self.otherWindow)]))
     }
 
     /// The captured failure: the scan run for the window at y=80 found a candidate sitting exactly on the
@@ -88,18 +113,30 @@ final class BruteForceWindowMatchTests: XCTestCase {
     /// member of A stopped being drawn and A vanished from the switcher.
     func testRejectsATabParkedOnAnotherWindowOfTheSameApp() {
         XCTAssertFalse(BruteForceWindowMatch.isPlausibleInactiveTab(
-            candidate: Self.otherWindow, requester: Self.requester, otherWindowsOfApp: [Self.otherWindow]))
+            candidateWid: Self.candidateWid, candidate: Self.otherWindow, requester: Self.requester,
+            otherWindowsOfApp: [(Self.otherWid, Self.otherWindow)]))
+    }
+
+    /// The deadlock: after Merge All Windows the absorbed tab is ordered out, but the inventory still carries
+    /// its own row as visible, at its own frozen frame. Matching that row rejected the candidate against
+    /// ITSELF and deferred it to a window that no longer exists, so it was never adopted and its row was never
+    /// refreshed. Two tabs of a 6-tab merge were lost from the group permanently (live, 2026-09-17).
+    func testAdoptsATabWhoseOwnStaleSurfaceRowIsStillListed() {
+        let absorbed = CGRect(x: 913, y: 248, width: 757, height: 543)
+        XCTAssertTrue(BruteForceWindowMatch.isPlausibleInactiveTab(
+            candidateWid: Self.candidateWid, candidate: absorbed, requester: Self.requester,
+            otherWindowsOfApp: [(Self.candidateWid, absorbed), (Self.otherWid, Self.otherWindow)]))
     }
 
     /// Merge All Windows never converges the absorbed windows' frames: they keep their own cascade positions,
     /// frozen, one 29px step apart from each other and from the merged window. Demanding a match with the
-    /// requester would make those tabs permanently un-adoptable (T-03/T-04), so a frame that sits on NOTHING
+    /// requester would make those tabs permanently un-adoptable, so a frame that sits on NOTHING
     /// is waved through.
     func testAdoptsAMergedTabAtItsOwnFrozenCascadePosition() {
         let merged = CGRect(x: 942, y: 277, width: 757, height: 543)
         let absorbed = CGRect(x: 913, y: 248, width: 757, height: 543)
         XCTAssertTrue(BruteForceWindowMatch.isPlausibleInactiveTab(
-            candidate: absorbed, requester: merged, otherWindowsOfApp: []))
+            candidateWid: Self.candidateWid, candidate: absorbed, requester: merged, otherWindowsOfApp: []))
     }
 
     /// A tab whose size has drifted from its parent's (the tab bar resizes members) is still ours: the test is
@@ -107,13 +144,15 @@ final class BruteForceWindowMatchTests: XCTestCase {
     func testAdoptsATabWhoseSizeDriftedFromItsParent() {
         let drifted = CGRect(x: 80, y: 80, width: 1000, height: 412)
         XCTAssertTrue(BruteForceWindowMatch.isPlausibleInactiveTab(
-            candidate: drifted, requester: Self.requester, otherWindowsOfApp: [Self.otherWindow]))
+            candidateWid: Self.candidateWid, candidate: drifted, requester: Self.requester,
+            otherWindowsOfApp: [(Self.otherWid, Self.otherWindow)]))
     }
 
     /// Nothing known about the requester's frame (not tracked, or no geometry yet) — the gate has no evidence
     /// to reject on, and a missed adoption costs a retry while a wrong one hides a window.
     func testAdoptsWhenTheRequestersFrameIsUnknown() {
         XCTAssertTrue(BruteForceWindowMatch.isPlausibleInactiveTab(
-            candidate: Self.otherWindow, requester: nil, otherWindowsOfApp: [Self.otherWindow]))
+            candidateWid: Self.candidateWid, candidate: Self.otherWindow, requester: nil,
+            otherWindowsOfApp: [(Self.otherWid, Self.otherWindow)]))
     }
 }

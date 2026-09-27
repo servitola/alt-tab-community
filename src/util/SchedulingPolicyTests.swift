@@ -36,6 +36,88 @@ final class SchedulingPolicyTests: XCTestCase {
         XCTAssertEqual(ThrottleDecision.decide(lastFireNs: 0, nowNs: 30, delayNs: 200, tailScheduled: true), .coalesce)
     }
 
+    // MARK: - A1. ThrottleSlot
+
+    /// #6047: a page load retitles a Chrome window several times within 200ms, and the switcher must end on
+    /// the last title, not the second one
+    func testThrottleSlotTailRunsTheLatestWorkOfABurst() {
+        var slot = ThrottleSlot<String>()
+        XCTAssertEqual(slot.offer("A", nowNs: 0, delayNs: 200), .runNow)
+        XCTAssertEqual(slot.offer("B", nowNs: 30, delayNs: 200), .scheduleTail(remainingNs: 170))
+        XCTAssertEqual(slot.offer("C", nowNs: 60, delayNs: 200), .coalesce)
+        XCTAssertEqual(slot.offer("D", nowNs: 90, delayNs: 200), .coalesce)
+        XCTAssertEqual(slot.takeTail(nowNs: 200), "D")
+    }
+
+    func testThrottleSlotTailRestartsTheWindow() {
+        var slot = ThrottleSlot<String>()
+        _ = slot.offer("A", nowNs: 0, delayNs: 200)
+        _ = slot.offer("B", nowNs: 30, delayNs: 200)
+        XCTAssertEqual(slot.takeTail(nowNs: 200), "B")
+        XCTAssertFalse(slot.tailScheduled)
+        XCTAssertEqual(slot.offer("C", nowNs: 250, delayNs: 200), .scheduleTail(remainingNs: 150))
+    }
+
+    func testThrottleSlotTailWithNothingPendingRunsNothing() {
+        var slot = ThrottleSlot<String>()
+        _ = slot.offer("A", nowNs: 0, delayNs: 200)
+        XCTAssertNil(slot.takeTail(nowNs: 200))
+        XCTAssertEqual(slot.lastFireNs, 0)
+    }
+
+    /// the tail's deadline passed but its queue was busy, and a newer call ran on the leading edge first
+    func testThrottleSlotLateTailCannotLandOlderWorkOverNewer() {
+        var slot = ThrottleSlot<String>()
+        _ = slot.offer("A", nowNs: 0, delayNs: 200)
+        _ = slot.offer("B", nowNs: 30, delayNs: 200)
+        XCTAssertEqual(slot.offer("C", nowNs: 500, delayNs: 200), .runNow)
+        XCTAssertNil(slot.takeTail(nowNs: 510))
+    }
+
+    /// A reset leaves the slot as it was built: the next offer is a leading edge however recently the last
+    /// one ran, and the tail queued for the window being abandoned finds nothing to run.
+    func testThrottleSlotResetRestoresTheLeadingEdge() {
+        var slot = ThrottleSlot<String>()
+        _ = slot.offer("A", nowNs: 0, delayNs: 200)
+        XCTAssertEqual(slot.offer("B", nowNs: 30, delayNs: 200), .scheduleTail(remainingNs: 170))
+        slot.reset()
+        XCTAssertEqual(slot.offer("C", nowNs: 60, delayNs: 200), .runNow)
+        XCTAssertNil(slot.takeTail(nowNs: 200))
+    }
+
+    // MARK: - A2. RepaintCoalescingPolicy
+
+    func testRepaintLoneRequestWaitsOneFrame() {
+        // nothing painted yet, so no floor: the trailing edge is one frame out, never sooner
+        XCTAssertEqual(RepaintCoalescingPolicy.delayNs(nowNs: 1_000_000_000, notBeforeNs: 0), 16_000_000)
+    }
+
+    func testRepaintWaitsOutAFloorLeftByThePreviousPaint() {
+        // the previous paint's quiet ends 50ms out, which is further than one frame
+        XCTAssertEqual(RepaintCoalescingPolicy.delayNs(nowNs: 1_000_000_000, notBeforeNs: 1_050_000_000), 50_000_000)
+    }
+
+    func testRepaintFloorInsideOneFrameStillWaitsAFullFrame() {
+        // a floor only 5ms out must not pull the paint in ahead of the burst-merging window
+        XCTAssertEqual(RepaintCoalescingPolicy.delayNs(nowNs: 1_000_000_000, notBeforeNs: 1_005_000_000), 16_000_000)
+    }
+
+    func testRepaintQuietIsFourTimesTheMeasuredCost() {
+        // 21ms is a 35-tile paint, measured: it buys 84ms of quiet, i.e. repaints own at most a fifth of main
+        XCTAssertEqual(RepaintCoalescingPolicy.quietAfterNs(paintCostNs: 21_000_000), 84_000_000)
+    }
+
+    func testRepaintQuietFloorsAtOneFrame() {
+        // a 1ms paint would buy 4ms, which is less than a frame and would let the next one land in the same one
+        XCTAssertEqual(RepaintCoalescingPolicy.quietAfterNs(paintCostNs: 1_000_000), 16_000_000)
+        XCTAssertEqual(RepaintCoalescingPolicy.quietAfterNs(paintCostNs: 0), 16_000_000)
+    }
+
+    func testRepaintQuietCapsSoAPathologicalPaintCannotStarveTheSwitcher() {
+        // the 517ms paint seen in a capture would otherwise buy two full seconds of silence
+        XCTAssertEqual(RepaintCoalescingPolicy.quietAfterNs(paintCostNs: 517_000_000), 200_000_000)
+    }
+
     // MARK: - B. RetryPolicy
 
     func testRetryBackoffSequence() {
@@ -65,7 +147,7 @@ final class SchedulingPolicyTests: XCTestCase {
 
     /// The bug, as a rule: an attempt that adopted NOTHING must be retryable. The situation used to be recorded
     /// before the scan ran and then refused forever, so one fruitless attempt (the app's AX tree not ready yet
-    /// at launch) permanently gave up — measured over a QA run as 82 tab reads naming untracked tabs and zero
+    /// at launch) permanently gave up — measured live as 82 tab reads naming untracked tabs and zero
     /// adoptions, against 57 in a run whose first attempt happened to land.
     func testFruitlessScanIsRetriedOnTheSameSituation() {
         let situation = "lwouis\u{1}lwouis|1"
@@ -123,5 +205,166 @@ final class SchedulingPolicyTests: XCTestCase {
         XCTAssertEqual(InactiveTabScanPolicy.attemptsAfterScan(previousAttempts: 2, sameSituation: true, adopted: 0), 3)
         // a fresh situation restarts the budget rather than inheriting the previous one's
         XCTAssertEqual(InactiveTabScanPolicy.attemptsAfterScan(previousAttempts: 2, sameSituation: false, adopted: 0), 1)
+    }
+
+    /// A candidate the sweep found and the caller handed back — because it is parked on ANOTHER window of the
+    /// same app, so it is that window's tab — rewinds the cursor onto itself instead of being stepped over.
+    /// Two tab groups of one app used to be permanently uncrossable this way: each requester's sweep stopped
+    /// on the other group's tabs, dropped them, and moved the shared cursor past them, so the requester that
+    /// owned them started above them next time (measured live: six tabs collapsing to two).
+    func testACandidateLeftForAnotherWindowIsNotSteppedOver() {
+        XCTAssertEqual(InactiveTabScanPolicy.nextCursor(adopted: 0, deferredId: 21446, sweptTo: 21267), 21267)
+        XCTAssertEqual(InactiveTabScanPolicy.nextCursor(adopted: 0, deferredId: 21200, sweptTo: 21267), 21200)
+        // nothing deferred ⇒ resume where the sweep stopped, as before
+        XCTAssertEqual(InactiveTabScanPolicy.nextCursor(adopted: 0, deferredId: nil, sweptTo: 21267), 21267)
+        // an adoption restarts from the anchor: the window set moved, so the band to sweep did too
+        XCTAssertEqual(InactiveTabScanPolicy.nextCursor(adopted: 2, deferredId: 21200, sweptTo: 21267), 0)
+    }
+
+    // MARK: - D. SurfaceAcquisitionPolicy
+
+    /// a surface with no failure on record is swept, as before
+    func testAFreshSurfaceIsAlwaysAttempted() {
+        XCTAssertTrue(SurfaceAcquisitionPolicy.shouldAttempt(recordedSituation: nil, attempts: 0, situation: 7))
+    }
+
+    /// a failure is not a verdict: the situation keeps its attempts, because an app still building its
+    /// accessibility tree at launch fails transiently
+    func testAFailedSurfaceIsRetriedWithinTheBudget() {
+        for spent in 0..<SurfaceAcquisitionPolicy.maxAttemptsPerSituation {
+            XCTAssertTrue(SurfaceAcquisitionPolicy.shouldAttempt(recordedSituation: 7, attempts: spent, situation: 7))
+        }
+    }
+
+    /// past the cap the sweep leaves it out of subsequent process batches
+    func testAFailedSurfaceStopsAtTheCap() {
+        XCTAssertFalse(SurfaceAcquisitionPolicy.shouldAttempt(recordedSituation: 7,
+            attempts: SurfaceAcquisitionPolicy.maxAttemptsPerSituation, situation: 7))
+    }
+
+    /// the app gaining or losing a window is what plausibly makes a previously-unreachable element
+    /// reachable, so it restarts the budget however exhausted the last situation was
+    func testANewWindowSetMakesTheSurfaceEligibleAgain() {
+        XCTAssertTrue(SurfaceAcquisitionPolicy.shouldAttempt(recordedSituation: 7, attempts: 99, situation: 8))
+    }
+
+    /// the counter is per situation, not cumulative, so a long-lived app that churns windows never
+    /// accumulates its way into a permanent refusal
+    func testAttemptsResetOnANewSituation() {
+        XCTAssertEqual(SurfaceAcquisitionPolicy.attemptsAfterFailure(previousAttempts: 2, sameSituation: true), 3)
+        XCTAssertEqual(SurfaceAcquisitionPolicy.attemptsAfterFailure(previousAttempts: 2, sameSituation: false), 1)
+    }
+
+    /// a busy app is still inside its budget, so nothing that waits on the give-up verdict may act yet
+    func testGivingUpDoesNotHappenWhileTriesRemain() {
+        for spent in 0..<SurfaceAcquisitionPolicy.maxAttemptsPerSituation {
+            XCTAssertFalse(SurfaceAcquisitionPolicy.hasGivenUp(attempts: spent))
+        }
+    }
+
+    /// giving up is the same moment the sweep stops paying, never a later one: a caller must not act on a
+    /// verdict the sweep has not reached
+    func testGivingUpIsExactlyWhereTheSweepStops() {
+        XCTAssertTrue(SurfaceAcquisitionPolicy.hasGivenUp(attempts: SurfaceAcquisitionPolicy.maxAttemptsPerSituation))
+        XCTAssertFalse(SurfaceAcquisitionPolicy.shouldAttempt(recordedSituation: 7,
+            attempts: SurfaceAcquisitionPolicy.maxAttemptsPerSituation, situation: 7))
+    }
+
+    /// a new window set restarts the budget, so the app is not permanently condemned by one bad arrangement:
+    /// `hasGivenUp` reads the count the caller just stored, and that count resets with the situation
+    func testGivingUpIsUndoneByANewSituation() {
+        let afterReset = SurfaceAcquisitionPolicy.attemptsAfterFailure(previousAttempts: 99, sameSituation: false)
+        XCTAssertFalse(SurfaceAcquisitionPolicy.hasGivenUp(attempts: afterReset))
+    }
+
+    // MARK: - E. AX traversal bounds
+
+    func testTraversalReachesHighIdsWhileTimeRemains() {
+        var elapsed = 0.0
+        let target: UInt64 = 30_000
+        var found: UInt64?
+        let next = AxTraversalPolicy.scan(from: 0, elapsedMs: { elapsed }, candidate: { id -> UInt64? in
+            elapsed += 0.001
+            return id == target ? id : nil
+        }) { id, mayStart in
+            guard mayStart() else { return false }
+            found = id
+            return true
+        }
+        XCTAssertEqual(found, target)
+        XCTAssertEqual(next, target + 1)
+        XCTAssertLessThan(elapsed, AxTraversalPolicy.budgetMs)
+    }
+
+    func testTraversalResumesWithoutGapsAfterTheDeadline() {
+        var visited = [UInt64]()
+        var elapsed = 0.0
+        let next = AxTraversalPolicy.scan(from: 0, elapsedMs: { elapsed }, candidate: { $0 }) { id, mayStart in
+            guard mayStart() else { return false }
+            visited.append(id)
+            elapsed += 1
+            return false
+        }
+        XCTAssertEqual(visited.count, Int(AxTraversalPolicy.budgetMs))
+        XCTAssertTrue(visited.enumerated().allSatisfy { UInt64($0.offset) == $0.element })
+        XCTAssertEqual(next, UInt64(visited.count))
+        let end = AxTraversalPolicy.scan(from: next, elapsedMs: { 0 }, candidate: { $0 }) { id, mayStart in
+            XCTAssertTrue(mayStart())
+            visited.append(id)
+            return true
+        }
+        XCTAssertEqual(visited.last, next)
+        XCTAssertEqual(end, next + 1)
+    }
+
+    func testTraversalResumesCandidateInterruptedBetweenItsWindowAndRoleReads() {
+        var elapsed = 0.0
+        var roleReads = [UInt64]()
+        let next = AxTraversalPolicy.scan(from: 41, elapsedMs: { elapsed }, candidate: { $0 }) { id, mayStart in
+            guard mayStart() else { return false }
+            if id == 42 { elapsed = AxTraversalPolicy.budgetMs }
+            guard mayStart() else { return false }
+            roleReads.append(id)
+            return false
+        }
+        XCTAssertEqual(next, 42)
+        XCTAssertEqual(roleReads, [41])
+        let end = AxTraversalPolicy.scan(from: next, elapsedMs: { 0 }, candidate: { $0 }) { id, mayStart in
+            XCTAssertTrue(mayStart())
+            roleReads.append(id)
+            return true
+        }
+        XCTAssertEqual(end, 43)
+        XCTAssertEqual(roleReads, [41, 42])
+    }
+
+    func testTraversalRetriesCandidateWhenConstructionUsesTheRemainingTime() {
+        var elapsed = 0.0
+        let next = AxTraversalPolicy.scan(from: 7, elapsedMs: { elapsed }, candidate: { id in
+            elapsed = AxTraversalPolicy.budgetMs
+            return id
+        }) { _, mayStart in
+            XCTAssertFalse(mayStart())
+            return false
+        }
+        XCTAssertEqual(next, 7)
+    }
+
+    func testTraversalCountsMissingCandidatesAndDoesNotWrapAtTheLastId() {
+        var constructed = 0
+        let next = AxTraversalPolicy.scan(from: 10, elapsedMs: { Double(constructed) }, candidate: { _ -> UInt64? in
+            constructed += 1
+            return nil
+        }) { _, _ in XCTFail("A missing element cannot be inspected"); return false }
+        XCTAssertEqual(constructed, Int(AxTraversalPolicy.budgetMs))
+        XCTAssertEqual(next, UInt64(10 + constructed))
+        XCTAssertEqual(AxTraversalPolicy.scan(from: UInt64.max - 1, elapsedMs: { 0 }, candidate: { $0 }) {
+            _, mayStart in mayStart()
+        }, UInt64.max)
+    }
+
+    func testAxTraversalStopsAtTheWallClockBudget() {
+        XCTAssertTrue(AxTraversalPolicy.mayStartIpc(elapsedMs: AxTraversalPolicy.budgetMs - 0.001))
+        XCTAssertFalse(AxTraversalPolicy.mayStartIpc(elapsedMs: AxTraversalPolicy.budgetMs))
     }
 }

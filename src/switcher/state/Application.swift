@@ -21,8 +21,18 @@ class Application: NSObject {
     /// low-res source apart from one caused by an undersized `maxPossibleAppIconSize`.
     var iconSourcePixels: Int?
     var dockLabel: String?
+    /// Mirrors of the two `NSRunningApplication` properties this class reads repeatedly. Reading either one
+    /// off `runningApplication` triggers a full LaunchServices dynamic-property refresh, and
+    /// `canShowWindowlessPlaceholder` reads three of them per call. Both are KVO-compliant, so the observers
+    /// below keep these exact instead of re-fetching. Seeded before `ensureAxUiElement()`, which reads
+    /// `activationPolicy` during `init`.
+    private(set) var activationPolicy: NSApplication.ActivationPolicy
+    private(set) var isTerminated: Bool
     var focusedWindow: Window? = nil
     var alreadyRequestedToQuit = false
+    /// The tracking pipeline's identity for this process, so a late teardown cannot hit a replacement that
+    /// reused the pid (`AxObserverRegistry.processExited`).
+    var trackingGeneration: UInt64 = 0
     var debugId: String
 
     /// Forwards every `ApplicationState` field by name — `app.pid` resolves to `state.pid`,
@@ -38,10 +48,7 @@ class Application: NSObject {
             return 84
         }
         // Big Sur redesigned app icons. A big change from square icons to rounded icons, and reducing their size; we trim that padding
-        if #available(macOS 11.0, *) {
-            return 24
-        }
-        return 0
+        return 24
     }()
 
     /// Converting NSImage to CGImage may seem simple, but it's actually very tricky. Lots of time has been put to make it work robustly
@@ -62,8 +69,7 @@ class Application: NSObject {
         let sourceWidth = finalWidth + padding * 2
         // we ask the NSImage for the closest image it has to our desired size. It's likely to return a 1024x1024 or 512x512 image; whichever is closest
         var proposedRect = CGRect(origin: .zero, size: NSSize(width: sourceWidth, height: sourceWidth))
-        // this convoluted style avoids a crash on macOS 10.13 (see #5255)
-        let hints : [NSImageRep.HintKey : NSNumber] = [.interpolation : NSNumber(value: NSImageInterpolation.high.rawValue)]
+        let hints: [NSImageRep.HintKey: NSNumber] = [.interpolation: NSNumber(value: NSImageInterpolation.high.rawValue)]
         guard let cgImage = icon.cgImage(forProposedRect: &proposedRect, context: nil, hints: hints) else { return nil }
         // we have to crop this image; let's scale our intended padding, given the image size we got
         let paddingScaled = padding * (CGFloat(cgImage.width) / sourceWidth)
@@ -75,13 +81,15 @@ class Application: NSObject {
         return (result, cgImage.width)
     }
 
-    init(_ runningApplication: NSRunningApplication) {
+    init(_ runningApplication: NSRunningApplication, pid: pid_t) {
         self.runningApplication = runningApplication
         state = ApplicationState(
-            pid: runningApplication.processIdentifier,
+            pid: pid,
             bundleIdentifier: runningApplication.bundleIdentifier,
             localizedName: runningApplication.localizedName,
             isHidden: runningApplication.isHidden)
+        activationPolicy = runningApplication.activationPolicy
+        isTerminated = runningApplication.isTerminated
         bundleURL = runningApplication.bundleURL
         executableURL = runningApplication.executableURL
         debugId = "(pid:\(state.pid) \(state.bundleIdentifier ?? bundleURL?.absoluteString ?? executableURL?.absoluteString ?? state.localizedName))"
@@ -91,25 +99,53 @@ class Application: NSObject {
         // AXVisualSupportAgent…). A process listing is not what a bug report needs; `DebugProfile` already
         // reports the count, and `RunningApplicationsEvents` logs launches and quits.
         Logger.debug { self.debugId }
+        // Here rather than at a call site: a process reaches the model through `Applications.createActualApp`
+        // AND through the synchronous `findOrCreate` an AX/WindowServer event for an unknown pid takes, and
+        // hooking only the first left every app discovered by the second with no AX observer at all.
+        AttentionEngine.processStarted(state.pid)
+        trackingGeneration = AttentionEngine.generation(of: state.pid)
+        AxObserverRegistry.shared.processStarted(state.pid)
         ensureAxUiElement()
         kvObservers = [
-            runningApplication.observe(\.activationPolicy, options: [.new]) { [weak self] _, _ in
+            observeMirror(\.activationPolicy) { [weak self] app, _ in
                 guard let self else { return }
-                if self.runningApplication.activationPolicy != .regular {
-                    self.removeWindowlessAppWindow()
-                }
+                self.activationPolicy = app.activationPolicy
+                if self.canShowWindowlessPlaceholder() { _ = self.addWindowlessWindowIfNeeded() }
+                else { self.removeWindowlessAppWindow() }
                 self.ensureAxUiElement()
             },
-        ]
+            observeMirror(\.isTerminated) { [weak self] app, _ in
+                self?.isTerminated = app.isTerminated
+            },
+        ].compactMap { $0 }
+    }
+
+    /// Observing an `NSRunningApplication` property makes AppKit subscribe to a LaunchServices notification
+    /// callback, and when that subscription fails AppKit raises NSInternalInconsistencyException
+    /// ("Failed to register for runningApplicationNotificationCallback") instead of returning, which
+    /// terminated AltTab from `init`. Losing an observer only costs the mirror's freshness: the value
+    /// seeded above stands, and `RunningApplicationsEvents` still sees launches and quits.
+    private func observeMirror<Value>(_ keyPath: KeyPath<NSRunningApplication, Value>,
+                                      _ handler: @escaping (NSRunningApplication, NSKeyValueObservedChange<Value>) -> Void) -> NSKeyValueObservation? {
+        var observation: NSKeyValueObservation?
+        guard ObjCExceptionCatcher.attempt({
+            observation = self.runningApplication.observe(keyPath, options: [.new], changeHandler: handler)
+        }) else {
+            Logger.warning { "KVO registration refused by LaunchServices \(self.debugId)" }
+            return nil
+        }
+        return observation
     }
 
     deinit {
         Logger.debug { self.debugId }
-        // `NSRunningApplication` KVO removal can throw NSInternalInconsistencyException
-        // ("Failed to register for runningApplicationNotificationCallback") — an Apple bug
-        // when the underlying notification XPC service has gone away (e.g. observed app
-        // terminated, or we are quitting). Pre-emptively invalidate inside an ObjC try/catch;
-        // the subsequent automatic ivar destroy of `kvObservers` is then a no-op.
+        // Safety net for any path that drops an Application without going through
+        // `Applications.removeRunningApplications`. Checked against the generation this object registered,
+        // so a late deinit cannot tear down a replacement process that reused the pid.
+        AxObserverRegistry.shared.processExited(state.pid, generation: trackingGeneration)
+        // Removing the observation raises the same AppKit exception as registering it (see `observeMirror`),
+        // here when the notification XPC service has gone away: the observed app terminated, or we are
+        // quitting. Invalidate inside an ObjC try/catch, so the automatic ivar destroy below is a no-op.
         let observers = kvObservers
         kvObservers = nil
         ObjCExceptionCatcher.catching {
@@ -118,9 +154,9 @@ class Application: NSObject {
     }
 
     func ensureAxUiElement() {
-        // AX event subscriptions are gone — WindowServerEvents owns window state. The app's AXUIElement is
-        // still created lazily, for the on-demand reads (subrole/title/tabs) and the window actions.
-        if runningApplication.activationPolicy != .prohibited && axUiElement == nil {
+        // The app-level observer registry owns semantic notifications. This element is the separate handle
+        // used for discovery reads (subrole/title/tabs), the focused-window seed, and window actions.
+        if activationPolicy != .prohibited && axUiElement == nil {
             axUiElement = AXUIElementCreateApplication(self.pid)
         }
     }
@@ -129,7 +165,7 @@ class Application: NSObject {
         guard icon == nil else { return }
         BackgroundWork.screenshotsQueue.addOperation { [weak self] in
             guard let self, self.icon == nil else { return }
-            let r = Application.appIconWithoutPadding(runningApplication.icon)
+            let r = Application.appIconWithoutPadding(self.runningApplication.icon)
             DispatchQueue.main.async { [weak self] in
                 self?.icon = r?.image
                 self?.iconSourcePixels = r?.sourcePixels
@@ -139,8 +175,7 @@ class Application: NSObject {
 
     @discardableResult
     func addWindowlessWindowIfNeeded() -> Window? {
-        guard runningApplication.activationPolicy == .regular && !runningApplication.isTerminated
-               && !(Windows.list.contains { $0.application.pid == self.pid && !$0.isPhantom }) else { return nil }
+        guard canShowWindowlessPlaceholder() else { return nil }
         let window = Window(self)
         Windows.appendWindow(window)
         focusedWindow = nil
@@ -150,6 +185,15 @@ class Application: NSObject {
         Logger.debug { "windowless + \(self.runningApplication.localizedName ?? "?") pid=\(self.pid) (no non-phantom window)" }
         App.refreshOpenUiAfterExternalEvent([])
         return window
+    }
+
+    private func canShowWindowlessPlaceholder() -> Bool {
+        let ownWindows = Windows.list.filter { $0.application.pid == state.pid }
+        return WindowlessApplicationResolver.shouldCreate(
+            isRegular: activationPolicy == .regular,
+            isTerminated: isTerminated,
+            hasExistingPlaceholder: ownWindows.contains { $0.isWindowlessApp },
+            hasNonPhantomWindow: ownWindows.contains { !$0.isWindowlessApp && !$0.isPhantom })
     }
 
     func removeWindowlessAppWindow() {

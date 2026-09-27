@@ -95,6 +95,16 @@ enum LanguagePreference: CaseIterable, MacroPreference {
     var appleLanguageCode: String? {
         Self.metadata[self]!.code
     }
+
+    /// AppKit resolves which `.lproj` the app loads from `AppleLanguages` at launch, so writing it
+    /// only takes effect after a restart. `.systemDefault` means removing the key, not writing one.
+    func applyToAppleLanguages() {
+        if self == .systemDefault {
+            UserDefaults.standard.removeObject(forKey: "AppleLanguages")
+        } else {
+            UserDefaults.standard.set([appleLanguageCode!], forKey: "AppleLanguages")
+        }
+    }
 }
 
 enum ShortcutStylePreference: CaseIterable, SfSymbolMacroPreference {
@@ -225,7 +235,7 @@ enum GroupAppsPreference: CaseIterable, MacroPreference {
 
     var localizedString: LocalizedString {
         switch self {
-            case .mainWindow: return NSLocalizedString("Show main window", comment: "")
+            case .mainWindow: return NSLocalizedString("Show one window per app", comment: "")
             case .allWindows: return NSLocalizedString("Show all windows", comment: "")
         }
     }
@@ -328,33 +338,6 @@ enum AppearanceSizePreference: CaseIterable, SfSymbolMacroPreference {
             case .medium: return .moonphaseLastQuarterInverse
             case .large: return .moonphaseWaningCrescentInverse
             case .auto: return .sparkles
-        }
-    }
-}
-
-enum ThemePreference: CaseIterable, ImageMacroPreference {
-    case macOs
-    case windows10
-
-    var localizedString: LocalizedString {
-        switch self {
-            case .macOs: return " macOS"
-            case .windows10: return "❖ Windows 10"
-        }
-    }
-
-    var image: WidthHeightImage {
-        switch self {
-            case .macOs: return WidthHeightImage(name: "macos")
-            case .windows10: return WidthHeightImage(name: "windows10")
-        }
-    }
-
-    // periphery:ignore
-    var themeParameters: ThemeParameters {
-        switch self {
-            case .macOs: return ThemeParameters(label: localizedString, cellCornerRadius: 10, windowCornerRadius: 23)
-            case .windows10: return ThemeParameters(label: localizedString, cellCornerRadius: 0, windowCornerRadius: 0)
         }
     }
 }
@@ -463,13 +446,6 @@ struct WidthHeightImage {
         self.height = height
         self.name = name
     }
-}
-
-// periphery:ignore
-struct ThemeParameters {
-    let label: String
-    let cellCornerRadius: CGFloat
-    let windowCornerRadius: CGFloat
 }
 
 typealias LocalizedString = String

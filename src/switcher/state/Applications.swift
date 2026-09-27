@@ -4,10 +4,14 @@ import ApplicationServices
 class Applications {
     static var list = [Application]()
     static var frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
-    // Throttlers coalesce redundant work. They are SEPARATE from AXCallScheduler, which is a pure executor
-    // (bounded pools + retry, no throttle). Each one below states what it coalesces and why:
-    // A — suppress redundant inbound events: coalesce resize/move/title bursts to ≤1 attribute read per window
-    static let windowAttributesThrottler = ThrottlerWithKey(delayInMs: 200)
+    // Discovery, attribute reads and WindowServer state deliberately have no clock throttle. Measured over
+    // 12 lifecycle/Space/tab/volume scenarios, the old shared 200ms gate suppressed only 3 of 50 requests,
+    // delayed 12 by 203-210ms, and guarded model writes costing 0.21ms mean / 0.84ms max. AX keeps one call
+    // per key in flight and retains the latest pending request; WindowServer reads keep one active batch
+    // and one pending set.
+    // Throttlers coalesce redundant work. Each one below states what it coalesces and why:
+    // A — cap title pushes chosen by another app to ≤1 model update per window per 200ms
+    static let titleThrottler = ThrottlerWithKey(delayInMs: 200)
     // B — suppress redundant recompute: ≤1 full window-inventory scan per second (on switcher show)
     static let fullRescanThrottler = Throttler(delayInMs: 1000)
     // B — ≤1 Dock-badge fetch per second
@@ -20,6 +24,71 @@ class Applications {
     /// just removed — the window came back for one summon, was flagged phantom on the next, and only then got
     /// its app's placeholder (#5849). Suppresses the SWEEP only; see `refreshWindowsViaWindowServer`.
     static var widsConfirmedClosed = Set<CGWindowID>()
+    /// Surfaces the inventory sweep could not acquire an AX element for, with the app window-set version it
+    /// failed at and how many attempts that situation has spent (`SurfaceAcquisitionPolicy`). Keyed by wid;
+    /// the pid rides along so an app quitting can drop its entries. Cleared on a successful acquisition, on
+    /// the wid being re-created, on window removal, on app quit, and whenever the WindowServer stops listing
+    /// the wid at all.
+    static var failedAcquisitions = [CGWindowID: (pid: pid_t, situation: UInt64, attempts: Int)]()
+    private struct PendingAxCreation {
+        let pid: pid_t
+        let element: AXUIElement
+        let tabGroup: TabGroupObservation
+        let expiresAt: TimeInterval
+    }
+    private static var pendingAxCreations = [CGWindowID: PendingAxCreation]()
+    private struct PendingAxEndReconciliation {
+        let token: UInt64
+        let pid: pid_t
+        let isTabbed: Bool
+        let groupWids: [CGWindowID]
+        let previousTabCount: Int?
+        let axQueryCoversWindow: Bool
+        /// the group's `AXTabGroup` identities, and whether a member is on a visible Space so the current-Space
+        /// AX read would list the group's active tab if the group still existed
+        let groupTokens: Set<TabGroupToken>
+        let axQueryCoversGroup: Bool
+        var ax: AxElementEndAvailability?
+        var freshElement: AXUIElement?
+        var groupShrank = false
+        var groupGone = false
+        var surfacePresent: Bool?
+    }
+    private static var axEndSequence: UInt64 = 0
+    private static var pendingAxEnds = [CGWindowID: PendingAxEndReconciliation]()
+
+    /// Pids the discovery path has already refused, and what they were refused as. Read through
+    /// `ApplicationVerdictCache.refusalStillAnswers`, which owns both rules (discovery-only, bundle id must
+    /// still match) and says why each is load-bearing. Dropped in `removeRunningApplications` alongside the
+    /// other per-pid caches.
+    static var refusedByDiscovery = [pid_t: RefusedApplication]()
+    private static var latestWindowServerScan: UInt64 = 0
+
+    static func noteAcquisitionFailed(_ wid: CGWindowID, _ pid: pid_t, _ situation: UInt64) {
+        // The sweep already refuses to ask in the dark (`refreshWindowsViaWindowServer`); this is the same
+        // rule for a batch issued while the screen was up that lands after it locked. It has to hold here
+        // too, because giving up also CONDEMNS a window below, and a locked screen is the one moment where
+        // an app answering "no windows" means nothing.
+        guard !ScreenLockEvents.isScreenLocked else { return }
+        let previous = failedAcquisitions[wid]
+        let attempts = SurfaceAcquisitionPolicy.attemptsAfterFailure(
+            previousAttempts: previous?.attempts ?? 0, sameSituation: previous?.situation == situation)
+        failedAcquisitions[wid] = (pid, situation, attempts)
+        guard SurfaceAcquisitionPolicy.hasGivenUp(attempts: attempts) else { return }
+        Windows.dropUndescribedAttentionAdmission(wid)
+    }
+
+    static func forgetAcquisitionFailure(_ wid: CGWindowID) {
+        failedAcquisitions[wid] = nil
+    }
+
+    /// Every verdict the sweep reached about one process, dropped. Its two callers are the two moments a
+    /// verdict about that process stops meaning anything: it exited, or it started answering accessibility
+    /// after answering nothing, which is the moment its windows may be acquirable at last
+    /// (`AxObserverRegistry.applySubscriptionResult`).
+    static func forgetAcquisitionFailures(pid: pid_t) {
+        failedAcquisitions = failedAcquisitions.filter { $0.value.pid != pid }
+    }
 
     static func initialDiscovery() {
         addInitialRunningApplications()
@@ -27,12 +96,12 @@ class Applications {
     }
 
     static func addInitialRunningApplications() {
-        addRunningApplications(NSWorkspace.shared.runningApplications, false)
+        addRunningApplications(NSWorkspace.shared.runningApplications)
     }
 
+    /// The four correction passes, fired together behind the fixed throttle.
     static func manuallyRefreshAllWindows() {
         fullRescanThrottler.throttleOrProceed {
-            Logger.debug { "manuallyRefreshAllWindows" }
             syncSpacesState()
             refreshWindowsViaWindowServer()
             reviewExistingWindows()
@@ -55,7 +124,8 @@ class Applications {
         let phantomWids = Windows.list.compactMap { $0.isPhantom ? $0.cgWindowId : nil }
         guard !phantomWids.isEmpty else { return }
         CGSCallScheduler.existingWindowIds(among: phantomWids) { alive in
-            guard let alive else { return } // query failed; don't discard on incomplete data
+            // Never discard on incomplete data.
+            guard let alive else { return }
             let dead = Windows.list.filter { $0.isPhantom && ($0.cgWindowId.map { !alive.contains($0) } ?? false) }
             guard !dead.isEmpty else { return }
             Logger.debug { "remove phantomSweep count=\(dead.count) \(dead.map { $0.debugId })" }
@@ -67,13 +137,14 @@ class Applications {
     }
 
     /// Refresh Space topology + per-window Space/screen membership via SkyLight, OFF the main thread, then
-    /// reconcile the open switcher only if something moved. This is the per-summon Space refresh that used
-    /// to block `Windows.updatesBeforeShowing` (#5721) — relocated here (runs ~0.25s after show, throttled),
-    /// and first so its correction lands before the best-effort window passes. Mirrors `refreshIsPhantom`'s
-    /// capture-on-main → query-off-main → apply-on-main pattern.
+    /// reconcile the open switcher only if something moved. Deliberately NOT inside
+    /// `Windows.updatesBeforeShowing`, where it blocked the show (#5721): it runs ~0.25s after the show,
+    /// throttled, and first in its pass so its correction lands before the best-effort window passes.
+    /// Capture on main → query off-main → apply on main, like the other cross-thread refreshes here.
     static func syncSpacesState() {
         let mainScreenUuid = Spaces.mainScreenUuid()
         let trackedWids = Windows.list.compactMap { $0.cgWindowId }
+        let querySequence = Spaces.beginQuery()
         CGSCallScheduler.run {
             let snapshot = Spaces.query(mainScreenUuid, includeWindowMap: true)
             // #5791: the inverted per-Space enumeration can miss a window (e.g. Slack), leaving it absent from
@@ -88,7 +159,7 @@ class Applications {
                 // per-window query agree the tab is nowhere; a non-empty answer means the tab keeps a stale
                 // Space and the group is never wiped. Logged because the test model has to assume one.
                 backfillProbe.append("#\(wid)→\(spaces.map { "\($0)" } ?? "noAnswer")")
-                if let spaces, !spaces.isEmpty { windowToSpacesMap[wid] = spaces }
+                if let spaces { windowToSpacesMap[wid] = spaces }
             }
             // CORROBORATE the wids both reads left unplaced, because "no Space" is not what an empty answer
             // means. CGS returns a non-NULL EMPTY array for a wid it has no record of at all (measured on
@@ -105,7 +176,7 @@ class Applications {
             // because the strong-signal phantoms it must not resurrect (Joplin / Sprig / `show:false`
             // Electron) are caught by a separate pipeline that this cannot reach: `cgsWindowListsRead` latches
             // them from the two CGS window lists, and that latch hides a window whatever its `spaceIds` say.
-            let stillUnplaced = trackedWids.filter { windowToSpacesMap[$0] == nil }
+            let stillUnplaced = trackedWids.filter { windowToSpacesMap[$0]?.isEmpty != false }
             let placedByWindowServer = Set(WindowServerQuery.query(stillUnplaced)
                 .filter { $0.spaceTypeMask != 0 }.map { $0.wid })
             Logger.debug { "spacesSync enumerated=\(snapshot.windowToSpacesMap.count)/\(trackedWids.count) "
@@ -117,32 +188,49 @@ class Applications {
                 // `queried` is `trackedWids` as captured ABOVE, before the off-main work: windows discovered
                 // while this pass ran were never asked about, and the reducer must not read our silence about
                 // them as "CGS places them nowhere" (see `.spacesSynced`).
-                let topologyChanged = Spaces.applyTopology(snapshot)
+                guard let topologyChanged = Spaces.applyTopology(snapshot, issuedAt: querySequence) else {
+                    Logger.debug { "spacesSync drop stale issue=\(querySequence)" }
+                    return
+                }
                 TrackedWindowStateBridge.dispatch(.spacesSynced(windowToSpaces: windowToSpacesMap,
-                    queried: Set(trackedWids), placedByWindowServer: placedByWindowServer,
+                    queried: Set(trackedWids), answered: Set(windowToSpacesMap.keys),
+                    placedByWindowServer: placedByWindowServer,
                     topologyChanged: topologyChanged))
             }
         }
     }
 
-    /// Window discovery: take the all-Space wid set from the WindowServer and ACQUIRE an AX element for each
-    /// genuinely-new app-level window (via `WindowElementAcquisition`), then discriminate it with WS-owned
-    /// facts (geometry/level/fullscreen/minimized from the snapshot) + a light AX read (subrole/role/title/
-    /// tabs). Already-tracked windows are skipped — events keep their geometry live, reviewExistingWindows their title/tabs.
+    /// Window discovery inventories every WindowServer surface, then acquires AX semantics only for plausible
+    /// parentless destinations. Physical rows remain separate from tracked `Window`s, so unresolved native
+    /// tabs cannot block inactive-tab adoption.
     static func refreshWindowsViaWindowServer() {
         // the all-Space wid list comes from ONE CGSCopyWindowsWithOptionsAndTags call over every Space
         // (verified to match the per-Space fan-out), not a second windowToSpacesMap rebuild — syncSpacesState
         // owns the per-window membership map; here we only need the wid set.
         let allSpaceIds = Spaces.idsAndIndexes.map { $0.0 }
         guard !allSpaceIds.isEmpty else { return }
+        latestWindowServerScan += 1
+        let scanSequence = latestWindowServerScan
+        let inventorySequence = WindowSurfaceInventory.beginSnapshot()
+        let queriedWids = Set(Windows.list.compactMap { $0.cgWindowId })
         CGSCallScheduler.run {
             let allSpaceWids = CGSCallScheduler.windowsInSpaces(allSpaceIds, true)
             // phantom detection reuses this same all-Space fetch (was a separate per-show CGS double-query
             // that also ran on the AX pool): a wid CGS omits from "visible" but keeps in "all" is alive-but-hidden.
             let visibleWids = Set(CGSCallScheduler.windowsInSpaces(allSpaceIds, false))
             let allWids = Set(allSpaceWids)
-            let appWindows = WindowServerQuery.query(allSpaceWids).filter { WsWindowState.isApplicationWindowLevel($0) }
+            let rawWindows = WindowServerQuery.query(allSpaceWids)
             DispatchQueue.main.async {
+                guard scanSequence == latestWindowServerScan else {
+                    Logger.debug { "windowScan drop stale issue=\(scanSequence) latest=\(latestWindowServerScan)" }
+                    return
+                }
+                WindowSurfaceInventory.replace(rawWindows, issuedAt: inventorySequence)
+                // Consume the inventory's accepted version of each row. A targeted query may have updated
+                // one after this snapshot was issued; feeding the original answer onward would bypass the
+                // very ordering fence `replace` just applied.
+                let acceptedRawWindows = rawWindows.compactMap { WindowSurfaceInventory.raw($0.wid) }
+                Windows.reevaluatePhysicalEvidence(acceptedRawWindows)
                 // Drain the confirmed-closed tombstones against the two lists we just fetched, BEFORE they
                 // gate anything: a wid CGS lists as visible again is genuinely back (a reopened window is
                 // untagged, wherever its Space), and a wid CGS finally forgot is gone for good. What's left is
@@ -152,45 +240,123 @@ class Applications {
                 widsConfirmedClosed.formIntersection(allWids)
                 widsConfirmedClosed.subtract(visibleWids)
                 // Same reconcile for the opt-in dedup set: this enumeration is the only place that sees which
-                // wids still exist, and destroy events don't erase reliably. Before the loop below, so a
-                // pruned wid that IS still app-level is re-subscribed in this very pass.
+                // wids still exist, and destroy events don't erase reliably.
                 WindowServerEvents.pruneSubscriptions(allWids)
-                for raw in appWindows {
-                    // Opt in BEFORE the acquisition can reject it: subscribing costs nothing and commits to
-                    // nothing, and a wid we skip here is one whose later re-show we cannot hear (see
-                    // `WindowServerEvents.subscribe`).
+                // **Nothing is asked in the dark, and nothing is concluded from it.** A locked screen makes
+                // every app publish zero windows (#6021), so a sweep that runs then acquires nothing at all
+                // and spends the surface budget on every window on the machine. That budget is keyed to the
+                // app's window set, which a quiescent background app never moves, so verdicts reached in the
+                // dark outlive the lock and the windows stay icon placeholders once the screen is back
+                // (#6031). Measured 2026-09-13 with the screen locked: every app whose window AltTab had to
+                // acquire was a placeholder, while the two it already held elements for were untouched.
+                // Read once, so the whole pass judges against one verdict rather than a flag that can flip
+                // mid-enumeration.
+                let screenIsDark = ScreenLockEvents.isScreenLocked
+                var acquisitionRequests = [(raw: WsRawWindow, app: Application, situation: UInt64)]()
+                for raw in acceptedRawWindows {
+                    let physical = PhysicalSurface(raw)
+                    guard WindowAdmissionResolver.shouldAcquireSemantics(physical) ||
+                            Windows.byWindowId[raw.wid]?.admissionEvidence == .attention else { continue }
                     WindowServerEvents.subscribe(raw.wid)
-                    // This enumeration is the authority on level, so it also clears a stale "not an
-                    // application window" verdict — the recovery path for a window re-leveled after creation,
-                    // or one whose destroy event never came before its number was reused.
-                    WindowServerEvents.noteApplicationLevel(raw.wid)
-                    guard let app = findOrCreate(raw.pid, false) else { continue }
+                    guard let app = findOrCreate(raw.pid) else { continue }
                     // tracked windows with a live element stay fresh via the WS event stream
                     // (geometry/min/fullscreen) + reviewExistingWindows (title/tabs); discovery only ACQUIRES
                     // genuinely-new windows.
                     guard Windows.byWindowId[raw.wid]?.axUiElement == nil else { continue }
                     guard !widsConfirmedClosed.contains(raw.wid) else { continue }
-                    AXCallScheduler.shared.schedule(key: "wid-\(raw.wid)-acquire", context: app.debugId, pid: raw.pid, scan: true) {
-                        if let element = WindowDiscriminator.acquireElementOrReject(raw.wid, raw.pid, .otherSpaceViaBruteForce) {
-                            addDiscoveredWindow(element, raw, app)
-                        }
-                    }
+                    guard !screenIsDark else { continue }
+                    // A surface that has failed to acquire three times at this app's current window set is
+                    // not asked a fourth time. Eligible surfaces are collected here and grouped by pid below,
+                    // so one app pays at most one 250ms traversal for the whole inventory pass rather than one
+                    // per wid. Event-driven discovery is untouched.
+                    let situation = Windows.appWindowSetVersion[raw.pid] ?? 0
+                    let previousAttempt = failedAcquisitions[raw.wid]
+                    guard SurfaceAcquisitionPolicy.shouldAttempt(recordedSituation: previousAttempt?.situation,
+                        attempts: previousAttempt?.attempts ?? 0, situation: situation) else { continue }
+                    acquisitionRequests.append((raw, app, situation))
                 }
+                scheduleSurfaceAcquisitions(acquisitionRequests)
+                // Bound the failure table by the same enumeration that gates everything else here: a wid the
+                // WindowServer no longer lists can never be swept again, so its record is dead weight.
+                failedAcquisitions = failedAcquisitions.filter { allWids.contains($0.key) }
                 // regular apps with no windows show as an icon placeholder. It's dropped when a real window
                 // arrives (Window.init) or when an existing window un-phantoms (Window.updateSpaces), so a
                 // window that recovers its Space after a fullscreen transition clears the stale placeholder
                 // instead of leaving both the window tile and the icon tile shown.
-                for app in list { _ = app.addWindowlessWindowIfNeeded() }
+                //
+                // An app whose surfaces are still being acquired is not windowless: this very enumeration
+                // just proved it owns a window, and only the AX element is missing. Measured 2026-09-02 on a
+                // cold start: this sweep landed 34ms before the acquisition, and a summon in that gap drew
+                // Finder, Chrome, ChatGPT and TextEdit as four icon placeholders (measured live).
+                //
+                // The placeholders also DEFEATED the fix for that frame. `App.showUiOrCycleSelection` waits
+                // for the launch inventory only while `Windows.list` is empty, and four placeholders are not
+                // empty, so the panel opened immediately on them instead of taking its grace period.
+                //
+                // The suppression is lifted by the batch itself, in `scheduleSurfaceAcquisitions`, not by a
+                // later sweep — sweeps are event-driven, so there may not be one.
+                //
+                // In the dark nothing was attempted, so "no surface being acquired" says nothing about which
+                // apps have windows and the whole pass would put a placeholder under every one of them.
+                if !screenIsDark {
+                    let pidsAcquiringSurfaces = Set(acquisitionRequests.map { $0.raw.pid })
+                    for app in list where !pidsAcquiringSurfaces.contains(app.pid) {
+                        _ = app.addWindowlessWindowIfNeeded()
+                    }
+                }
                 // phantom detection reuses this same all-Space fetch; the per-window verdicts + latches are
                 // the reducer's `.cgsWindowListsRead` branch
-                TrackedWindowStateBridge.dispatch(.cgsWindowListsRead(visible: visibleWids, all: allWids))
+                TrackedWindowStateBridge.dispatch(.cgsWindowListsRead(visible: visibleWids, all: allWids,
+                    queried: queriedWids))
             }
         }
     }
 
-    /// Acquire-and-discriminate a newly-discovered window. WindowServer-owned facts (geometry, level,
+    /// One inventory request per PROCESS, because every requested wid is tested by the same AXUIElementID
+    /// sequence. The scheduler key also coalesces a newer inventory arriving while this process's traversal is
+    /// in flight. Each unresolved wid keeps its own situation-keyed retry record; batching changes cost, not
+    /// eligibility or the meaning of a failure.
+    private static func scheduleSurfaceAcquisitions(_ requests: [(raw: WsRawWindow, app: Application, situation: UInt64)]) {
+        for (pid, batch) in Dictionary(grouping: requests, by: { $0.raw.pid }) {
+            guard let app = batch.first?.app else { continue }
+            let rows = batch.map { $0.raw }
+            AXCallScheduler.shared.schedule(key: "pid-\(pid)-surface-acquire", context: app.debugId, pid: pid, scan: true) {
+                let elements = WindowElementAcquisition.elements(for: rows, pid: pid,
+                    route: .otherSpaceViaBruteForce)
+                DispatchQueue.main.async {
+                    for request in batch {
+                        guard elements[request.raw.wid] != nil else {
+                            // Recorded against the situation the batch was ISSUED at, not the one current
+                            // when its shared 250ms traversal finished.
+                            noteAcquisitionFailed(request.raw.wid, pid, request.situation)
+                            continue
+                        }
+                        failedAcquisitions[request.raw.wid] = nil
+                    }
+                    // The sweep skipped this app's icon placeholder while the batch was in flight, on the
+                    // grounds that a surface being acquired is not a windowless app. When the batch resolves
+                    // NOTHING that has to end here rather than at the next sweep: sweeps are event-driven,
+                    // not periodic, so an app that answers nothing (SIGSTOP'd, hung) can wait indefinitely
+                    // for one — and until then it is absent from the switcher entirely while its windows sit
+                    // on screen, leaving the user no way back to them (measured live). Only on an empty batch: a
+                    // resolved element becomes a `Window` a few main-thread turns later, so testing the app
+                    // for windows here instead would put a placeholder up in that gap.
+                    // Not in the dark: an empty batch there is the locked screen answering, not the app.
+                    if elements.isEmpty && !ScreenLockEvents.isScreenLocked {
+                        _ = app.addWindowlessWindowIfNeeded()
+                    }
+                }
+                for request in batch {
+                    guard let element = elements[request.raw.wid] else { continue }
+                    addDiscoveredWindow(element, request.raw, request.app)
+                }
+            }
+        }
+    }
+
+    /// Acquire and classify a newly-discovered surface. WindowServer-owned facts (geometry, level,
     /// fullscreen) come from the snapshot `raw`; AX is read for what WS can't give cleanly — subrole/role
-    /// (discrimination), title (AX title is preferred), the main flag, minimized (the WS ordered-out bit is
+    /// (admission), title (AX title is preferred), the main flag, minimized (the WS ordered-out bit is
     /// ambiguous — see below), and tab children.
     /// Used for genuinely-new windows only (discovery + discoverWindow). Uses the "generic" bucket so a real
     /// focus event (in the "focus" bucket) is never clobbered.
@@ -211,12 +377,12 @@ class Applications {
             // its own window, skip it; otherwise it can't be ours, so proceed.
             if let panel = TilesPanel.shared, wid == panel.windowNumber { return }
             let isSelf = app.pid == AXUIElement.currentProcessPid
-            // minimized comes from AX (kAXMinimized) — a reliable, unambiguous signal — NOT the WS ordered-out
-            // bit, which is also cleared for closing / app-hidden / other-Space windows. (yabai sources
-            // minimize from AX the same way: seed kAXMinimized, then track miniaturize/deminiaturize.)
-            let keys = [kAXTitleAttribute, kAXSubroleAttribute, kAXRoleAttribute, kAXMainAttribute] + (isSelf ? [] : [kAXChildrenAttribute])
+            // The WS minimized tag is distinct from the ordered-out bit, which is also cleared for closing,
+            // app-hidden and other-Space windows.
+            let keys = [kAXTitleAttribute, kAXSubroleAttribute, kAXRoleAttribute, kAXMainAttribute]
             let a = try element.attributes(keys, pid: app.pid)
-            let tabSiblingTitles = isSelf ? nil : TabGroup.extractTabTitles(a.children)
+            let semantic = SemanticSurface(title: a.title, subrole: a.subrole, role: a.role, isMain: a.isMain)
+            let tabObservation: TabGroupObservation = isSelf ? .unknown : element.tabGroupObservation(pid: app.pid)
             let isFullscreen = WsWindowState.isFullscreen(raw)
             // Both from the SAME WindowServer snapshot this discovery already holds. Minimized used to be an
             // AX `kAXMinimized` read in the batch above; it is a WindowServer tag now, so it cannot be
@@ -228,53 +394,77 @@ class Applications {
             // reflow on the first summon (misaligned space numbers / shifted title). Setting it right here makes
             // that later correction a no-op. Skipped for an adopted inactive tab: the query lies for those
             // (stale old Space), and a background tab's true membership is NO Space.
-            // A nil answer means the query said nothing at all; treated as empty here, exactly as before,
-            // because that is also `Window.init`'s state and the first `syncSpacesState` corroborates it.
-            let spaceIds = (isSelf || adoptedAsInactiveTab) ? [CGSSpaceID]()
-                : (CGSCallScheduler.windowSpaces(wid) ?? [])
+            // A nil answer says nothing. Keep it distinct from a completed empty answer: discovery can use
+            // the latter as Space-less evidence, while a later sync is responsible for filling an unknown.
+            let spaceMembership: SpaceMembershipObservation = (isSelf || adoptedAsInactiveTab) ? .known([])
+                : CGSCallScheduler.windowSpaces(wid).map { .known($0) } ?? .unavailable
             DispatchQueue.main.async { [weak app] in
                 guard let app else { return }
-                windowAttributesThrottler.throttleOrProceed(key: "\(wid)-generic") {
-                    // The shell's job ends at acquisition + raw-fact ingestion: findOrCreate applies the AX/WS
-                    // attributes (and appends a genuinely-new window). Everything decided AFTER that — the
-                    // pending-removal consume, the MRU promotion, the Space override for background tabs, the
-                    // tab-state update, the reconcile — is the reducer's `.discoveryLanded` branch. A REJECTED
-                    // window still dispatches, so the reducer's pending-removal marker stays self-draining.
-                    let findOrCreate = Windows.findOrCreate(element, wid, app, CGWindowLevel(raw.level), a.title, a.subrole, a.role, raw.bounds.size, raw.bounds.origin, isFullscreen, isMinimized)
-                    // not logged here: the reducer's `.discoveryLanded` line names this window with the facts
-                    // that actually matter (tab titles, group, Spaces, whether it was adopted as a tab)
-                    findOrCreate.0?.isMainWindow = a.isMain ?? false
-                    TrackedWindowStateBridge.dispatch(.discoveryLanded(wid: wid, accepted: findOrCreate.0 != nil,
-                        newlyTracked: findOrCreate.1, adoptedAsInactiveTab: adoptedAsInactiveTab,
-                        queriedSpaceIds: spaceIds, tabTitles: tabSiblingTitles))
+                // discovery always reads tabs (`isSelf` aside), so it teaches `TabReadPolicy` as much as the
+                // review pass does — and it is what settles a brand-new app's capability on its first window
+                if case .group = tabObservation {
+                    noteTabRead(wid: wid, pid: app.pid, foundTabGroup: true)
+                } else if tabObservation == .standalone {
+                    noteTabRead(wid: wid, pid: app.pid, foundTabGroup: false)
                 }
+                // The shell's job ends at acquisition + raw-fact ingestion: findOrCreate applies the AX/WS
+                // attributes (and appends a genuinely-new window). Everything decided AFTER that — the
+                // pending-removal consume, the MRU promotion, the Space override for background tabs, the
+                // tab-state update, the reconcile — is the reducer's `.discoveryLanded` branch. A surface
+                // not admitted yet still dispatches, so the reducer's pending-removal marker stays self-draining.
+                let findOrCreate = Windows.findOrCreate(element, raw, app, semantic, isFullscreen, isMinimized)
+                let pending = consumePendingAxCreation(wid: wid, pid: app.pid)
+                if let pending { findOrCreate.0?.rebindAxElement(pending.element) }
+                let observedTabs = pending?.tabGroup == .unknown ? tabObservation
+                    : (pending?.tabGroup ?? tabObservation)
+                // not logged here: the reducer's `.discoveryLanded` line names this window with the facts
+                // that actually matter (tab titles, group, Spaces, whether it was adopted as a tab)
+                findOrCreate.0?.isMainWindow = a.isMain ?? false
+                TrackedWindowStateBridge.dispatch(.discoveryLanded(wid: wid, accepted: findOrCreate.0 != nil,
+                    newlyTracked: findOrCreate.1, adoptedAsInactiveTab: adoptedAsInactiveTab,
+                    spaceMembership: spaceMembership, isOrderedIn: WsWindowState.isVisible(raw),
+                    tabGroup: observedTabs))
+                // A genuinely new window changes what the startup guess has to rank, so re-make it here
+                // rather than once on a timer that fires before discovery lands.
+                if findOrCreate.1 { Windows.reseedZOrderDuringStartup() }
             }
         }
     }
 
     /// WindowServer-driven per-window state refresh (geometry + fullscreen), replacing the AX attribute read
     /// on move/resize/visibility events and the Space-change fullscreen re-read. ONE batched WS query for the
-    /// whole wid set (off-main: ~84µs for a full screen vs ~15µs × N serial), decoded by WsWindowState,
-    /// applied on main in a single UI reconcile. Minimized IS read here (`WsWindowState.minimizedTag`) —
-    /// the ordered-out BIT cannot tell minimized from closing/other-Space, but the tag can, and unlike the AX
-    /// read it replaced it cannot be delayed by the window's own app. Callers coalesce upstream where the
-    /// input self-floods: the per-event path
-    /// throttles per-wid (windowAttributesThrottler, ≤1 query/200ms on a resize drag); the Space-change path
-    /// calls this once per transition.
+    /// whole wid set, off-main, and applied in one UI reconcile. Minimized comes from WindowServer tags.
+    /// One batch runs at a time; arrivals during it form one follow-up batch. Apply the completed answer
+    /// before starting that follow-up, so sustained resize input cannot supersede every result. A newer
+    /// semantic event fences its window out of the answer before inventory or reducer state can be written.
+    private static let windowStateReads = BatchCoalescer<CGWindowID> { wids, finish in
+        readWindowStatesViaWindowServer(Array(wids), finish)
+    }
+
     static func updateWindowStatesViaWindowServer(_ wids: [CGWindowID]) {
-        guard !wids.isEmpty else { return }
+        windowStateReads.request(Set(wids))
+    }
+
+    static func invalidateWindowStateReads(_ wids: Set<CGWindowID>) {
+        windowStateReads.invalidate(wids)
+    }
+
+    private static func readWindowStatesViaWindowServer(_ wids: [CGWindowID], _ finish: @escaping () -> Void) {
         CGSCallScheduler.run {
             let raws = WindowServerQuery.query(wids)
-            guard !raws.isEmpty else { return }
             // decode off-main; the apply (geometry writes, regroup, re-render/re-capture decisions) is the
             // reducer's `.windowServerStateRead` branch
-            let snapshots = raws.map {
-                WsWindowSnapshot(wid: $0.wid, position: $0.bounds.origin, size: $0.bounds.size,
-                    isFullscreen: WsWindowState.isFullscreen($0), isVisible: WsWindowState.isVisible($0),
-                    isMinimized: WsWindowState.isMinimized($0))
+            let decoded = raws.map { raw in
+                (raw, WsWindowSnapshot(wid: raw.wid, position: raw.bounds.origin, size: raw.bounds.size,
+                    isFullscreen: WsWindowState.isFullscreen(raw), isVisible: WsWindowState.isVisible(raw),
+                    isMinimized: WsWindowState.isMinimized(raw), alpha: raw.alpha))
             }
             DispatchQueue.main.async {
-                TrackedWindowStateBridge.dispatch(.windowServerStateRead(snapshots))
+                defer { finish() }
+                let fresh = decoded.filter { windowStateReads.accepts($0.0.wid) && Windows.byWindowId[$0.0.wid] != nil }
+                guard !fresh.isEmpty else { return }
+                Windows.reevaluatePhysicalEvidence(fresh.map { $0.0 })
+                TrackedWindowStateBridge.dispatch(.windowServerStateRead(fresh.map { $0.1 }))
             }
         }
     }
@@ -296,73 +486,386 @@ class Applications {
     ///
     /// Condemning on the weaker test than the one that re-adds the window is what made a live QQ window
     /// disappear and come back seconds later as a "new" window with no MRU history (#5785).
+    ///
+    /// The ordered-out edge is not the only way in, because it is not the only way a window dies. A window
+    /// CLOSED while it was already ordered out — parked on another Space, or behind an app-hide — emits no
+    /// second order-out, so nothing here was ever armed for it, and Finder's retained surface then kept the
+    /// corpse alive in every list we ask: the WindowServer ordered the dead surface back IN when the app
+    /// came back, so it was not even phantom, and the switcher drew a tile for a window that no longer
+    /// existed for the rest of the session (measured on macOS 26: hide Finder, close its window, unhide).
+    /// It cost more than one bad tile — the corpse's stale frame stood in as "another window of this app"
+    /// in `BruteForceWindowMatch.isPlausibleInactiveTab`, so every tab the app opened over it was rejected
+    /// as that window's tab and tab groups stopped being adopted at all (measured live, four separate scenarios). So
+    /// `refreshWindowTitleAndTabs` calls this too, on the one symptom a corpse cheaply has: the app not
+    /// answering for its element in the periodic review, which visits every tracked window.
     static func removeIfClosedAfterOrderOut(_ window: Window) {
-        guard let axWindow = window.axUiElement, let wid = window.cgWindowId else { return }
-        let pid = window.application.pid
-        AXCallScheduler.shared.schedule(key: "wid-\(wid)-liveness", pid: pid) {
-            let result = axWindow.liveness(pid: pid)
-            if result == .cannotComplete { throw AxError.runtimeError }
-            guard result == .invalidUIElement else {
-                Logger.debug { "liveness #\(wid) result=\(result.rawValue) verdict=alive" }
-                return
-            }
-            // Only the cheap `kAXWindows` route: the brute-force one is time-budgeted, so on an app with
-            // high AXUIElementIDs it can time out on a window that IS there and hand back the same false
-            // "closed" this guard exists to prevent.
-            let fresh = WindowElementAcquisition.element(for: wid, pid: pid, route: .currentSpaceViaApplicationWindows)
-            // Log all three verdicts: a capture where a window vanished needs to show whether this probe ran
-            // at all and what it answered.
-            Logger.debug { "liveness #\(wid) result=\(result.rawValue) verdict=\(fresh == nil ? "DEAD" : "staleRef")" }
-            DispatchQueue.main.async {
-                guard let fresh else {
-                    // Remember the verdict, or the inventory sweep re-acquires this very wid a beat later:
-                    // CGS keeps listing it and the app can still hand back an element for it (see
-                    // `widsConfirmedClosed`).
-                    widsConfirmedClosed.insert(wid)
-                    TrackedWindowStateBridge.dispatch(.livenessConfirmedDead(wid: wid))
-                    return
+        // An AX destroy usually leads this surface's order-out, so consume that one correlated duplicate.
+        // Delivery for another window — or an old delivery for this one — cannot disable the fallback.
+        guard let wid = window.cgWindowId,
+              AxObserverRegistry.shouldProbeAfterOrderOut(pid: window.application.pid, wid: wid,
+                at: ProcessInfo.processInfo.systemUptime) else { return }
+        removeIfClosed(window, probeLiveness: true)
+    }
+
+    /// The per-show review could not message a window's own element (`reviewExistingWindows`). Same verdict
+    /// path as the order-out, and it keeps the liveness probe, but it deliberately does NOT consume an AX
+    /// destroy correlation: a corpse is precisely a window for which this review obtained no usable answer,
+    /// so an earlier notification cannot make the backstop skip its independent check.
+    static func confirmClosedAfterNoAnswer(_ window: Window) {
+        removeIfClosed(window, probeLiveness: true)
+    }
+
+    /// Reconcile an app-side node end against an independently queried WindowServer surface. A replacement
+    /// AX node heals in place; physical absence confirms a close; retained Electron surfaces are retired only
+    /// when AX positively omits a non-tab, current-Space window. Tabs and other-Space AX absences remain
+    /// pending unless a positive group shrink, or the group's disappearance from every published window,
+    /// corroborates them (`AxElementEndPolicy`).
+    static func reconcileAxElementEnd(_ wid: CGWindowID) {
+        guard let window = Windows.byWindowId[wid] else { return }
+        axEndSequence += 1
+        let token = axEndSequence
+        let groupWids = TabGroups.siblingWids(of: wid) ?? [wid]
+        let previousTabCount = window.tabGroupObservation.titles?.count
+            ?? (window.tabCount > 1 ? window.tabCount : nil)
+        let axQueryCoversWindow: Bool
+        switch window.spaceMembershipObservation {
+        case .unavailable: axQueryCoversWindow = false
+        case .known(let ids):
+            axQueryCoversWindow = ids.isEmpty || ids.contains { Spaces.visibleSpaces.contains($0) }
+        }
+        let axQueryCoversGroup = groupWids.contains { memberWid in
+            guard case .known(let ids) = Windows.byWindowId[memberWid]?.spaceMembershipObservation else { return false }
+            return ids.contains { Spaces.visibleSpaces.contains($0) }
+        }
+        pendingAxEnds[wid] = PendingAxEndReconciliation(token: token, pid: window.application.pid,
+            isTabbed: groupWids.count > 1, groupWids: groupWids,
+            previousTabCount: previousTabCount, axQueryCoversWindow: axQueryCoversWindow,
+            groupTokens: Set(groupWids.compactMap { TabGroups.table.tokenByWid[$0] }),
+            axQueryCoversGroup: axQueryCoversGroup)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            guard pendingAxEnds[wid]?.token == token else { return }
+            queryAxElementEnd(wid: wid, token: token)
+            querySurfaceEnd(wid: wid, token: token)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.15) {
+            timeoutAxElementEnd(wid: wid, token: token)
+        }
+    }
+
+    private static func queryAxElementEnd(wid: CGWindowID, token: UInt64) {
+        guard let pending = pendingAxEnds[wid] else { return }
+        AXCallScheduler.shared.schedule(key: "wid-\(wid)-ax-end", pid: pending.pid) {
+            let outcome = WindowElementAcquisition.outcome(for: wid, pid: pending.pid,
+                route: .currentSpaceViaApplicationWindows)
+            var groupShrank = false
+            var siblingMayLive = false
+            if outcome == .absent, let previousTabCount = pending.previousTabCount {
+                for siblingWid in pending.groupWids where siblingWid != wid {
+                    let sibling = WindowElementAcquisition.outcome(for: siblingWid, pid: pending.pid,
+                                                                    route: .currentSpaceViaApplicationWindows)
+                    siblingMayLive = siblingMayLive || sibling != .absent
+                    guard case let .found(element) = sibling,
+                          case .group(let titles, _) = element.tabGroupObservation(pid: pending.pid) else { continue }
+                    groupShrank = titles.count < previousTabCount
+                    if groupShrank { break }
                 }
-                Windows.byWindowId[wid]?.rebindAxElement(fresh)
+            }
+            // Every tracked member absent is not yet a close: a tab created a moment ago can be the group's
+            // active tab before discovery lands, and it is the only member the app publishes. So ask the app
+            // whether any window it publishes still carries the group's identity.
+            let groupGone = outcome == .absent && pending.isTabbed && !siblingMayLive && pending.axQueryCoversGroup
+                && !pending.groupTokens.isEmpty && !appHostsTabGroup(pid: pending.pid, tokens: pending.groupTokens)
+            DispatchQueue.main.async {
+                receiveAxElementEnd(wid: wid, token: token, outcome: outcome, groupShrank: groupShrank,
+                                    groupGone: groupGone)
             }
         }
     }
 
-    /// A focus event (808) hit a wid we don't track yet — its create event was missed or is in-flight.
-    /// Discover just that one window (it's on the current Space, since it was focused) instead of a full
-    /// inventory. `Window.init`'s `checkIfFocused` then bumps its MRU order.
-    static func discoverWindow(_ wid: CGWindowID) {
+    /// Whether a window the app publishes on the current Space still names one of these `AXTabGroup`
+    /// elements. Silence from the app counts as "still hosted": only a positive answer may condemn.
+    private static func appHostsTabGroup(pid: pid_t, tokens: Set<TabGroupToken>) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        guard let published = AXUIElement.onCorrectThread(pid: pid, { try? app.windowsIncludingKeyAndMain() }) else {
+            return true
+        }
+        for window in published {
+            switch window.tabGroupObservation(pid: pid) {
+                case .unknown: return true
+                case .standalone: continue
+                case .group(_, let token):
+                    if let token, tokens.contains(token) { return true }
+            }
+        }
+        return false
+    }
+
+    private static func querySurfaceEnd(wid: CGWindowID, token: UInt64) {
         CGSCallScheduler.run {
-            guard let raw = WindowServerQuery.query([wid]).first else { return }
-            guard WindowDiscriminator.isApplicationWindow(raw) else {
-                // Menu, tooltip, Dock indicator. Remember the level verdict so this wid's next move / order-in
-                // costs nothing at all: no snapshot, no reducer pass, no repeat of this very query.
-                DispatchQueue.main.async { WindowServerEvents.noteNotApplicationLevel(wid) }
+            let present = WindowServerQuery.query([wid]).contains { $0.wid == wid }
+            DispatchQueue.main.async { receiveSurfaceEnd(wid: wid, token: token, present: present) }
+        }
+    }
+
+    private static func receiveAxElementEnd(wid: CGWindowID, token: UInt64,
+                                            outcome: WindowElementAcquisition.Outcome,
+                                            groupShrank: Bool, groupGone: Bool) {
+        guard var pending = pendingAxEnds[wid], pending.token == token else { return }
+        switch outcome {
+        case .found(let element):
+            pending.ax = .foundReplacement
+            pending.freshElement = element
+        case .absent: pending.ax = .absent
+        case .noAnswer: pending.ax = .noAnswer
+        }
+        pending.groupShrank = groupShrank
+        pending.groupGone = groupGone
+        pendingAxEnds[wid] = pending
+        finishAxElementEnd(wid: wid, token: token)
+    }
+
+    private static func receiveSurfaceEnd(wid: CGWindowID, token: UInt64, present: Bool) {
+        guard var pending = pendingAxEnds[wid], pending.token == token else { return }
+        pending.surfacePresent = present
+        pendingAxEnds[wid] = pending
+        finishAxElementEnd(wid: wid, token: token)
+    }
+
+    private static func finishAxElementEnd(wid: CGWindowID, token: UInt64) {
+        guard let pending = pendingAxEnds[wid], pending.token == token, let ax = pending.ax,
+              let surfacePresent = pending.surfacePresent else { return }
+        let verdict = AxElementEndPolicy.decide(ax: ax, surfacePresent: surfacePresent,
+            isTabbed: pending.isTabbed, groupShrank: pending.groupShrank, groupGone: pending.groupGone,
+            axQueryCoversWindow: pending.axQueryCoversWindow)
+        commitAxElementEnd(wid: wid, pending: pending, verdict: verdict)
+    }
+
+    private static func timeoutAxElementEnd(wid: CGWindowID, token: UInt64) {
+        guard let pending = pendingAxEnds[wid], pending.token == token else { return }
+        let verdict: AxElementEndVerdict = pending.freshElement != nil ? .replacementFound
+            : (pending.surfacePresent == false ? .confirmedClosed : .inconclusive)
+        commitAxElementEnd(wid: wid, pending: pending, verdict: verdict)
+    }
+
+    private static func commitAxElementEnd(wid: CGWindowID, pending: PendingAxEndReconciliation,
+                                           verdict: AxElementEndVerdict) {
+        // The evidence behind the verdict, so a capture says WHICH fact condemned or kept the window
+        Logger.debug { "axEnd #\(wid) verdict=\(verdict) ax=\(pending.ax.map { "\($0)" } ?? "pending") "
+            + "surface=\(pending.surfacePresent.map { "\($0)" } ?? "pending") tabbed=\(pending.isTabbed) "
+            + "shrank=\(pending.groupShrank) gone=\(pending.groupGone)" }
+        pendingAxEnds[wid] = nil
+        if let fresh = pending.freshElement { Windows.byWindowId[wid]?.rebindAxElement(fresh) }
+        if verdict == .confirmedClosed { widsConfirmedClosed.insert(wid) }
+        TrackedWindowStateBridge.dispatch(.axElementReconciled(wid: wid, verdict: verdict))
+    }
+
+    private static func removeIfClosed(_ window: Window, probeLiveness: Bool) {
+        guard let axWindow = window.axUiElement, let wid = window.cgWindowId else { return }
+        let pid = window.application.pid
+        // Same key for both entry points, so a destroy and the order-out that follows it 250ms later collapse
+        // into one read rather than two, and an app that rebuilds elements in a burst pays once.
+        AXCallScheduler.shared.schedule(key: "wid-\(wid)-liveness", pid: pid) {
+            guard probeLiveness else { return try confirmAbsentFromApp(wid: wid, pid: pid, reason: "axDestroy") }
+            let result = axWindow.liveness(pid: pid)
+            if result == .cannotComplete { throw AxError.appUnresponsive }
+            guard result == .invalidUIElement else {
+                Logger.debug { "liveness #\(wid) result=\(result.rawValue) verdict=alive" }
                 return
             }
-            DispatchQueue.main.async {
-                // Opt in HERE, not on the raw 811: the level is only known once the query above answers, and
-                // subscribing before it put every menu, tooltip and Dock indicator on our per-window stream.
-                //
-                // The cost is a gap: this wid's per-window events are unheard between its create and this
-                // line. MEASURED on macOS 26.5, 25 rapid create/destroy cycles with the WindowServer driven
-                // to ~99% CPU by 8 window-list hammers — gap p50 7.2ms, p99 12.7ms, and the WindowServer's
-                // first per-window event for a brand-new window never arrived before 7.1ms. A/B against a
-                // build that subscribed on the 811 instead: same 54 first-events, same 7.0ms floor, same
-                // distribution (p50 34ms), same 49 windows accepted. Nothing measurable is lost in the gap.
-                // Re-run that A/B before assuming it still holds on a new macOS.
-                //
-                // It is also survivable by construction: everything discovery reads next (geometry,
-                // minimized, fullscreen, Spaces, title) is read fresh right here, and the one signal that is
-                // NOT re-read, a focus 808, is compensated by `recentlyCreated` fronting a new window anyway.
-                // Deliberately before the guards below — a window AX rejects must stay subscribed (#5785).
-                WindowServerEvents.subscribe(wid)
-                guard Windows.byWindowId[wid] == nil, let app = findOrCreate(raw.pid, false) else { return }
-                AXCallScheduler.shared.schedule(key: "wid-\(wid)-acquire", context: app.debugId, pid: raw.pid, scan: true) {
-                    if let element = WindowDiscriminator.acquireElementOrReject(wid, raw.pid, .currentSpaceViaApplicationWindows) {
-                        addDiscoveredWindow(element, raw, app)
-                    }
+            try confirmAbsentFromApp(wid: wid, pid: pid, reason: "liveness")
+        }
+    }
+
+    /// Ask the OWNING APP whether it still lists this wid, and act on the answer. Runs on the AX pool.
+    ///
+    /// Only the cheap published-windows route: the brute-force one is time-budgeted, so on an app with high
+    /// AXUIElementIDs it can time out on a window that IS there and hand back the same false "closed" this
+    /// guard exists to prevent.
+    private static func confirmAbsentFromApp(wid: CGWindowID, pid: pid_t, reason: String) throws {
+        // A locked screen makes every app publish zero windows, so `.absent` here says "the screen is
+        // locked", not "the window is gone" (measured on macOS 26: locking condemned every tracked window
+        // 0.7s later, and they stayed gone until the next WindowServer rescan — #6021, which reads as the
+        // switcher listing only the frontmost window after a wake). Nothing can be learned in the dark, so
+        // throw and let the scheduler re-ask once the screen is back. Only this app-side route is void; the
+        // WindowServer half of `reconcileAxElementEnd` keeps answering while locked.
+        guard !ScreenLockEvents.isScreenLocked else { throw AxError.appUnresponsive }
+        let outcome = WindowElementAcquisition.outcome(for: wid, pid: pid, route: .currentSpaceViaApplicationWindows)
+        // Log all three verdicts: a capture where a window vanished needs to show whether this probe ran
+        // at all and what it answered.
+        Logger.debug { "\(reason) #\(wid) verdict=\(outcome == .absent ? "DEAD" : outcome == .noAnswer ? "noAnswer" : "staleRef")" }
+        // The app never answered, so nothing was learned. Throw rather than condemn: the scheduler retries
+        // with backoff, and a window whose app is merely busy stays in the switcher. Reading silence as
+        // "the app says this window is gone" is what the second opinion exists to prevent.
+        guard outcome != .noAnswer else { throw AxError.appUnresponsive }
+        DispatchQueue.main.async {
+            guard case let .found(fresh) = outcome else {
+                // The route reaches the current Space plus the app's key/main window, so it does not cover
+                // an arbitrary other-Space window. It may condemn only when a completed membership
+                // observation puts the window inside that scope; a display value borrowed from a tab or
+                // guessed at initialization is not evidence that the query covered it.
+                let axQueryCoversWindow = Windows.byWindowId[wid].map { window -> Bool in
+                    guard case let .known(ids) = window.spaceMembershipObservation else { return false }
+                    return ids.isEmpty || ids.contains { Spaces.visibleSpaces.contains($0) }
+                } ?? false
+                if !axQueryCoversWindow {
+                    Logger.debug { "\(reason) #\(wid) verdict=absentButOutOfScope — kept" }
+                    return
                 }
+                // Remember the verdict, or the inventory sweep re-acquires this very wid a beat later:
+                // CGS keeps listing it and the app can still hand back an element for it (see
+                // `widsConfirmedClosed`).
+                widsConfirmedClosed.insert(wid)
+                TrackedWindowStateBridge.dispatch(.livenessConfirmedDead(wid: wid))
+                return
             }
+            Windows.byWindowId[wid]?.rebindAxElement(fresh)
+        }
+    }
+
+    /// An app announced one of its window elements (`AxObserverRegistry.windowCreated`). Three things, all
+    /// idempotent: make sure the wid is tracked, refresh the cached element with the live one the
+    /// notification handed over, and record the tab group it named.
+    static func applyObservedWindowCreated(wid: CGWindowID, pid: pid_t, element: AXUIElement,
+                                           tabGroup: TabGroupObservation) {
+        guard let window = Windows.byWindowId[wid] else {
+            // Not tracked yet. The WindowServer's 811 is normally first and discovery is already in flight;
+            // this covers what 811 does not emit at all — a retained window shown again, and a background tab
+            // becoming selected for the first time.
+            let now = ProcessInfo.processInfo.systemUptime
+            pendingAxCreations = pendingAxCreations.filter { $0.value.expiresAt > now }
+            let expiresAt = now + 2
+            pendingAxCreations[wid] = PendingAxCreation(pid: pid, element: element, tabGroup: tabGroup,
+                expiresAt: expiresAt)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                guard pendingAxCreations[wid]?.pid == pid,
+                      pendingAxCreations[wid]?.expiresAt == expiresAt else { return }
+                pendingAxCreations[wid] = nil
+            }
+            return discoverWindow(wid)
+        }
+        guard window.application.pid == pid else { return }
+        window.rebindAxElement(element)
+        applyObservedTabGroup(wid: wid, pid: pid, observation: tabGroup, source: "axCreated")
+    }
+
+    /// **The element every OTHER notification arrives holding, offered to a window that has none.** A
+    /// notification is a push: nothing in AppKit's posting path consults a Space, so an app announcing a
+    /// window on another Space hands over that window's element even though `kAXWindows` omits it and
+    /// `kAXFocusedWindow` / `kAXMainWindow` name a different one. Measured cross-process on macOS 26.6.2:
+    /// the element carries the right wid, reads its attributes, and accepts writes for as long as the
+    /// window lives. For such a wid this is a free
+    /// acquisition on a channel already open, where the alternative is the brute-force sweep.
+    ///
+    /// **Only for a window with no element**, deliberately. Adopting on every focus change would rebind a
+    /// perfectly good element on the hot path and pay the role read below every time, for nothing: a window
+    /// AltTab already resolved keeps its element when it moves to another Space. Staleness has its own repair
+    /// (`Window.refreshedAxElement`).
+    ///
+    /// **The role read is not optional.** `_AXUIElementGetWindow` answers with the CONTAINING window's id for
+    /// a descendant too, and apps do name descendants: Chrome posts `AXTitleChanged` with an `AXStaticText`
+    /// whose wid is its window's. Binding that as the window's element would send every later read and AX
+    /// action to a text node. `BruteForceWindowMatch.isTargetWindowRoot` is the same #5849 root check the
+    /// sweep applies to its candidates; the wid half is already proven by the caller, the role half is what
+    /// this pays one round trip for, and only for windows that have no element at all.
+    static func applyObservedElement(wid: CGWindowID, pid: pid_t, element: AXUIElement, source: String) {
+        guard let window = Windows.byWindowId[wid], window.application.pid == pid,
+              window.axUiElement == nil else { return }
+        AXCallScheduler.shared.schedule(key: "wid-\(wid)-adopt", context: window.application.debugId, pid: pid) {
+            let role = try element.attributes([kAXRoleAttribute], pid: pid).role
+            guard BruteForceWindowMatch.isTargetWindowRoot(candidateWid: wid, candidateRole: role,
+                targetWid: wid) else { return }
+            DispatchQueue.main.async {
+                guard let window = Windows.byWindowId[wid], window.application.pid == pid,
+                      window.axUiElement == nil else { return }
+                Logger.debug { "axAdopt #\(wid) pid=\(pid) src=\(source)" }
+                window.rebindAxElement(element)
+            }
+        }
+    }
+
+    private static func consumePendingAxCreation(wid: CGWindowID, pid: pid_t) -> PendingAxCreation? {
+        guard let pending = pendingAxCreations.removeValue(forKey: wid), pending.pid == pid,
+              pending.expiresAt > ProcessInfo.processInfo.systemUptime else { return nil }
+        return pending
+    }
+
+    /// A tab group an app named through its own AX notification rather than through the per-show read
+    /// (`AxObserverRegistry.readTabGroup`). This is the group's own identity — every window of a native group
+    /// hands out the same `AXTabGroup` element while it is the selected tab — arriving at the instant the OS
+    /// announces the switch, which is what the reducer otherwise reconstructs from arrival-time pairing.
+    /// `source` names the notification that carried the group, because both channels log this same line and a
+    /// capture otherwise cannot say whether the create path contributed anything at all.
+    static func applyObservedTabGroup(wid: CGWindowID, pid: pid_t, observation: TabGroupObservation,
+                                      source: String) {
+        guard let window = Windows.byWindowId[wid], window.application.pid == pid else { return }
+        // Recorded whatever the answer was, INCLUDING the empty one. "No tab group" is a read that happened,
+        // and it is the only thing that moves an app to `AppTabCapability.neverSeenTabGroup` — without it
+        // every main-window change on every app would pay the `kAXChildren` walk forever, which is the exact
+        // expense `TabReadPolicy` exists to ration.
+        noteTabRead(wid: wid, pid: pid, foundTabGroup: observation.titles != nil,
+            appWindowSetVersion: Windows.appWindowSetVersion[pid] ?? 0)
+        // A completed standalone answer is retained as distinct from unknown, but does not by itself dissolve
+        // an existing group (only the selected tab exposes a bar at all). Membership shrinks on positive
+        // evidence such as a smaller completed group, Space handover, or window removal.
+        Logger.debug { "axTabGroup #\(wid) src=\(source) observation=\(observation)" }
+        TrackedWindowStateBridge.dispatch(.titleAndTabsRead(wid: wid, tabGroup: observation,
+            reconcileTabs: true, changedSoFar: false))
+    }
+
+    /// Physical events and attention signals name specific windows for discovery. Batch their initial query
+    /// without a full inventory; `Window.init` seeds the app's per-process focus fact after append.
+    private static let discoveryReads = BatchCoalescer<CGWindowID> { wids, finish in
+        CGSCallScheduler.run {
+            let roots = Dictionary(uniqueKeysWithValues: WindowServerQuery.query(Array(wids)).map { ($0.wid, $0) })
+            let chains = wids.map { wid in
+                (wid, WindowParentChain.resolve(wid) { wids.contains($0) ? roots[$0] : WindowServerQuery.query([$0]).first })
+            }
+            DispatchQueue.main.async {
+                defer { finish() }
+                for (wid, chain) in chains { applyDiscoveredChain(wid, chain) }
+            }
+        }
+    }
+
+    static func discoverWindow(_ wid: CGWindowID) {
+        discoveryReads.request([wid])
+    }
+
+    private static func applyDiscoveredChain(_ wid: CGWindowID, _ chain: WindowParentChain.Resolution) {
+        guard let raw = chain.rows.last else { return }
+        WindowSurfaceInventory.upsert(chain.rows)
+        for parent in chain.rows.dropFirst() { WindowServerEvents.subscribe(parent.wid) }
+        if chain.stop != .root {
+            Logger.warning { "stopped WindowServer parent chain for #\(wid) at #\(raw.wid): \(chain.stop)" }
+        }
+        guard WindowAdmissionResolver.shouldAcquireSemantics(PhysicalSurface(raw)) ||
+                Windows.byWindowId[raw.wid]?.admissionEvidence == .attention else { return }
+        // Opt in HERE, not on the raw 811: the physical acquisition verdict is only known once the
+        // query above answers, and subscribing before it put every menu, tooltip and Dock indicator
+        // on our per-window stream.
+        //
+        // The cost is a gap: this wid's per-window events are unheard between its create and this
+        // line. MEASURED on macOS 26.5, 25 rapid create/destroy cycles with the WindowServer driven
+        // to ~99% CPU by 8 window-list hammers — gap p50 7.2ms, p99 12.7ms, and the WindowServer's
+        // first per-window event for a brand-new window never arrived before 7.1ms. A/B against a
+        // build that subscribed on the 811 instead: same 54 first-events, same 7.0ms floor, same
+        // distribution (p50 34ms), same 49 windows accepted. Nothing measurable is lost in the gap.
+        // Re-run that A/B before assuming it still holds on a new macOS.
+        //
+        // It is also survivable by construction: everything discovery needs is read fresh here, and
+        // exact attention arriving inside the gap waits for this wid to have a model object before it
+        // commits. The per-app discovery seed covers an already-front app at cold start.
+        // Deliberately before the guards below — a window AX rejects must stay subscribed (#5785).
+        WindowServerEvents.subscribe(raw.wid)
+        // A window kept on WindowServer evidence alone must NOT block its own re-acquisition: it is
+        // tracked, so the old "already tracked, nothing to do" guard would leave it unverified and
+        // unshown for good. Proceed whenever there is no AX element yet.
+        guard Windows.byWindowId[raw.wid]?.axUiElement == nil,
+              let app = findOrCreate(raw.pid) else { return }
+        AXCallScheduler.shared.schedule(key: "wid-\(raw.wid)-acquire", context: app.debugId, pid: raw.pid, scan: true) {
+            guard let element = WindowElementAcquisition.element(for: raw.wid, pid: raw.pid,
+                route: .currentSpaceViaApplicationWindows) else { return }
+            addDiscoveredWindow(element, raw, app)
         }
     }
 
@@ -394,7 +897,9 @@ class Applications {
     /// An attempt should act on, and be recorded against, the facts as they are when it runs.
     static func discoverInactiveTabs(_ app: Application, _ untrackedTitles: [String], _ requesterWid: CGWindowID) {
         let pid = app.pid
-        tabAdoptThrottler.throttleOrProceed(key: "\(pid)") {
+        // `app` is captured explicitly: the throttled block deliberately holds it for up to 3s (see
+        // above), so the scheduled block's `[weak app]` only starts mattering once this one is gone.
+        tabAdoptThrottler.throttleOrProceed(key: "\(pid)") { [app] in
             let appWindowCount = Windows.list.reduce(0) { $1.application.pid == pid ? $0 + 1 : $0 }
             let situation = "\(untrackedTitles.sorted().joined(separator: "\u{1}"))|\(appWindowCount)"
             let previous = lastInactiveTabScan[pid]
@@ -407,20 +912,56 @@ class Applications {
             let knownIds = Windows.list.filter { $0.application.pid == pid }.compactMap { $0.axUiElement?.id() }
             let startId = InactiveTabScanPolicy.scanStart(cursor: inactiveTabScanCursor[pid],
                                                           lowestKnownId: knownIds.min())
-            // Where this app's other windows sit, so a candidate parked on one of them can be recognised as
-            // ITS tab rather than the requester's — see `BruteForceWindowMatch.isPlausibleInactiveTab`.
-            let requesterFrame = Windows.byWindowId[requesterWid]?.position.map { CGRect(origin: $0, size: .zero) }
-            let otherFrames = Windows.list.filter { $0.application.pid == pid && $0.cgWindowId != requesterWid }
-                .compactMap { $0.position.map { p in CGRect(origin: p, size: .zero) } }
-            // `isPlausibleInactiveTab` waves everything through when the requester has no frame or the app has
-            // no other windows, so both inputs are logged: without them a green run cannot be told apart from
-            // a gate that is wired up but inert.
-            Logger.debug { "inactive-tab scan pid:\(pid) knownIds=\(knownIds.sorted().prefix(6)) from=\(startId) requester=#\(requesterWid)@\(requesterFrame?.origin.debugDescription ?? "nil") others=\(otherFrames.map { $0.origin })" }
+            // Where this app's other windows sit, so a candidate parked on one of them can be recognised
+            // as ITS tab rather than the requester's — see `BruteForceWindowMatch.isPlausibleInactiveTab`.
+            //
+            // **Asked of the WINDOW SERVER, not of `Windows.list`.** The gate can only reject a candidate
+            // parked on another of this app's windows if it KNOWS that window, and at launch this scan
+            // routinely runs before the app's second window has been tracked: `others=[]` then waves
+            // everything through, and the tabs of a window we had not seen yet were adopted as the
+            // requester's. Two real windows ended up in ONE tab group, the second hidden inside it as a
+            // non-representative member and no longer offered at all (live 2026-08-25 — the scan logged
+            // `requester=#52149@(80,600) others=[]` and then adopted two tabs sitting at (80,80)).
+            //
+            // Read from the sweep's own inventory rather than re-asking the OS. The rows are the same
+            // decoder's output, so the frames stay in one coordinate space, and after a full sweep the
+            // inventory is a SUPERSET of the on-screen list (every app-level surface on every Space). That
+            // retires a system-wide `CGWindowListCopyWindowInfo` plus a second batched `SLSWindowQueryWindows`
+            // over everything it returned — two heavy calls per scan, and cold start fires one per tabbed app.
+            // `visibleSurfaces` answers nil before the first sweep, which is the only state where the
+            // inventory could hand back the short list that made `others=[]` dangerous; there we pay for the
+            // live call exactly as before.
+            //
+            // It can be LONG, though: a row keeps its last-known `visible` bit until a sweep refreshes it, so
+            // a window ordered out a moment ago is still in here. That is why each frame travels with its wid
+            // — `isPlausibleInactiveTab` needs it to keep a candidate from rejecting itself against its own
+            // stale row.
+            let surfaces = WindowSurfaceInventory.visibleSurfaces(pid: pid)
+            let frames = surfaces.map { rows -> (CGRect?, [(wid: CGWindowID, frame: CGRect)]) in
+                // the requester may be off-screen mid-transition, so it is looked up in the whole inventory
+                let requester = WindowSurfaceInventory.raw(requesterWid).map { CGRect(origin: $0.bounds.origin, size: .zero) }
+                return (requester, rows.filter { $0.wid != requesterWid }
+                    .map { (wid: $0.wid, frame: CGRect(origin: $0.bounds.origin, size: .zero)) })
+            }
             AXCallScheduler.shared.schedule(key: "pid-\(pid)-tabadopt", context: app.debugId, pid: pid, scan: true) { [weak app] in
                 guard let app else { return }
+                let (requesterFrame, otherFrames) = frames ?? {
+                    let onScreen = WindowServerQuery.query(CGWindow.windows(.optionOnScreenOnly).compactMap { $0.id() })
+                    return (onScreen.first { $0.wid == requesterWid }.map { CGRect(origin: $0.bounds.origin, size: .zero) },
+                            onScreen.filter { $0.pid == pid && $0.wid != requesterWid && WsWindowState.isVisible($0) }
+                                .map { (wid: $0.wid, frame: CGRect(origin: $0.bounds.origin, size: .zero)) })
+                }()
+                // `isPlausibleInactiveTab` waves everything through when the requester has no frame or the app
+                // has no other windows, so both inputs are logged: without them a green run cannot be told
+                // apart from a gate that is wired up but inert.
+                Logger.debug { "inactive-tab scan pid:\(pid) knownIds=\(knownIds.sorted().prefix(6)) from=\(startId) requester=#\(requesterWid)@\(requesterFrame?.origin.debugDescription ?? "nil") others=\(otherFrames.map { "#\($0.wid)@\($0.frame.origin)" })" }
                 let (found, nextId) = AXUIElement.untrackedWindowsByBruteForce(
                     pid, excluding: trackedWids, matching: untrackedTitles, from: startId)
                 var adopted = 0
+                // The lowest id this sweep found and handed back because it belongs to ANOTHER window of
+                // this app. It is a find for that window's own sweep, so the cursor must not step over it
+                // (`InactiveTabScanPolicy.nextCursor`).
+                var deferredId: AXUIElementID?
                 for (wid, element, title) in found {
                     guard let raw = WindowServerQuery.query([wid]).first else {
                         Logger.debug { "inactive tab wid:\(wid) '\(title)' has no WindowServer data; skipping" }
@@ -444,8 +985,10 @@ class Applications {
                         continue
                     }
                     guard BruteForceWindowMatch.isPlausibleInactiveTab(
-                        candidate: raw.bounds, requester: requesterFrame, otherWindowsOfApp: otherFrames) else {
-                        Logger.debug { "inactive tab candidate wid:\(wid) '\(title)' sits at \(raw.bounds.origin), on another window of this app rather than on #\(requesterWid); it is that window's tab, skipping" }
+                        candidateWid: wid, candidate: raw.bounds, requester: requesterFrame,
+                        otherWindowsOfApp: otherFrames) else {
+                        if let elementId = element.id() { deferredId = min(deferredId ?? elementId, elementId) }
+                        Logger.debug { "inactive tab candidate wid:\(wid) '\(title)' sits at \(raw.bounds.origin), on another window of this app rather than on #\(requesterWid); it is that window's tab, deferring it to that window's own scan" }
                         continue
                     }
                     Logger.debug { "discovered inactive tab via brute-force: wid:\(wid) '\(title)' at \(raw.bounds.origin) for #\(requesterWid)" }
@@ -457,12 +1000,13 @@ class Applications {
                 // transient miss (the app's AX tree not ready yet at launch).
                 let attempts = InactiveTabScanPolicy.attemptsAfterScan(previousAttempts: previous?.attempts ?? 0,
                     sameSituation: previous?.situation == situation, adopted: adopted)
+                let cursor = InactiveTabScanPolicy.nextCursor(adopted: adopted, deferredId: deferredId, sweptTo: nextId)
                 if adopted == 0 {
-                    Logger.debug { "inactive-tab scan found nothing (attempt \(attempts)/\(InactiveTabScanPolicy.maxAttemptsPerSituation), ids \(startId)..<\(nextId))" }
+                    Logger.debug { "inactive-tab scan found nothing (attempt \(attempts)/\(InactiveTabScanPolicy.maxAttemptsPerSituation), ids \(startId)..<\(nextId), resuming at \(cursor))" }
                 }
                 DispatchQueue.main.async {
                     lastInactiveTabScan[pid] = (situation, attempts)
-                    inactiveTabScanCursor[pid] = adopted > 0 ? 0 : nextId
+                    inactiveTabScanCursor[pid] = cursor
                 }
             }
         }
@@ -471,9 +1015,23 @@ class Applications {
     /// Light per-window AX read for already-tracked windows: the facts the WindowServer genuinely cannot
     /// deliver — title (no WS title-change event), the main-window flag, and tab siblings. Minimized is NOT
     /// among them any more: it is `WsWindowState.minimizedTag`, read from the WS query instead.
-    /// Shares the "wid-N-generic" dedup/throttle key so it never double-reads a window the discovery pass
-    /// just refreshed. Runs for every tracked window on each show.
+    /// Shares the "wid-N-generic" scheduler key with discovery. One read may run while the scheduler retains
+    /// only the latest pending request, so backpressure follows the actual AX cost instead of a guessed delay.
     static func refreshWindowTitleAndTabs(_ axWindow: AXUIElement, _ wid: CGWindowID, _ app: Application, _ reconcileTabs: Bool = true) {
+        // Snapshotted HERE, on main, at issue time. Recording the version the answer lands against instead
+        // would mark a window up to date with a window set that changed while its read was in flight.
+        let appWindowSetVersionAtRead = Windows.appWindowSetVersion[app.pid] ?? 0
+        // A read with no tabs to reconcile exists ONLY to refresh the title, and an app whose observer holds
+        // a live `AXTitleChanged` subscription has already pushed it (`applyObservedTitle`). So this is the
+        // whole call skipped, not a shortened one: order-in and order-out fire on every minimize, every
+        // Space move and every raise, which made them the most frequent AX calls the app issued.
+        // Nothing waits on the `.titleAndTabsRead` this skips — it would reconcile no tabs and report no
+        // change. The per-show pass takes this same skip, so for an app that pushes titles the title
+        // backstop is `TabReadPolicy`'s rolling cursor: the windows it elects for a tab read get their title
+        // re-read too, and the rest ride on the push. Narrow on purpose — the gaps a push leaves are an
+        // observer rebuild and an element adopted after the fact, both rare, both corrected within a few
+        // summons, against a read that would otherwise cost one round trip per window per summon.
+        guard reconcileTabs || !AxObserverRegistry.deliversTitles(app.pid) else { return }
         AXCallScheduler.shared.schedule(key: "wid-\(wid)-generic", context: app.debugId, pid: app.pid, scan: true) { [weak app] in
             guard let app else { return }
             guard wid != 0 else { return }
@@ -486,41 +1044,127 @@ class Applications {
             // ordered-out window reports its AXTabGroup inconsistently mid-transition, and order-out never
             // changes tab membership anyway. Saves the kAXChildren IPC too.
             let readTabs = !isSelf && reconcileTabs
-            let keys = [kAXTitleAttribute, kAXMainAttribute] + (readTabs ? [kAXChildrenAttribute] : [])
-            let a = try axWindow.attributes(keys, pid: app.pid)
-            let tabSiblingTitles = readTabs ? TabGroup.extractTabTitles(a.children) : nil
-            DispatchQueue.main.async {
-                windowAttributesThrottler.throttleOrProceed(key: "\(wid)-generic") {
+            let keys = [kAXTitleAttribute, kAXSubroleAttribute, kAXRoleAttribute, kAXMainAttribute]
+            let a: AXAttributes
+            do {
+                a = try axWindow.attributes(keys, pid: app.pid)
+            } catch AxError.noAnswer {
+                // The element itself could not be messaged — the app answered nothing about a window it is
+                // supposed to own. That is the only cheap symptom a CORPSE has, and this pass is the only
+                // one that visits every tracked window, so it is where the corpse has to be caught. It is
+                // not a verdict: `confirmClosedAfterNoAnswer` re-asks liveness and then asks the app for
+                // the wid, and removes only on a real `.absent`. `.appUnresponsive` deliberately keeps
+                // propagating so the scheduler retries with backoff instead.
+                DispatchQueue.main.async {
                     guard let window = Windows.byWindowId[wid] else { return }
-                    // raw-fact ingestion stays here (bestEffortTitle needs the CG-title fallback IPC); the
-                    // tab reconcile + re-render decision is the reducer's `.titleAndTabsRead` branch
-                    let newTitle = window.bestEffortTitle(a.title)
-                    let changed = window.title != newTitle
-                    if changed { window.title = newTitle; window.lastSearchQuery = nil }
-                    window.isMainWindow = a.isMain ?? false
-                    TrackedWindowStateBridge.dispatch(.titleAndTabsRead(wid: wid, tabTitles: tabSiblingTitles,
-                        reconcileTabs: reconcileTabs, changedSoFar: changed))
+                    confirmClosedAfterNoAnswer(window)
                 }
+                return
+            }
+            let tabObservation: TabGroupObservation = readTabs ? axWindow.tabGroupObservation(pid: app.pid) : .unknown
+            DispatchQueue.main.async {
+                // This read HAPPENED, and "no tab group" is as much of an answer as a group.
+                if readTabs, tabObservation != .unknown {
+                    if case .group = tabObservation {
+                        noteTabRead(wid: wid, pid: app.pid, foundTabGroup: true,
+                            appWindowSetVersion: appWindowSetVersionAtRead)
+                    } else {
+                        noteTabRead(wid: wid, pid: app.pid, foundTabGroup: false,
+                            appWindowSetVersion: appWindowSetVersionAtRead)
+                    }
+                }
+                guard let window = Windows.byWindowId[wid] else { return }
+                // raw-fact ingestion stays here (bestEffortTitle needs the CG-title fallback IPC); the
+                // tab reconcile + re-render decision is the reducer's `.titleAndTabsRead` branch
+                let newTitle = window.bestEffortTitle(a.title)
+                let semantic = SemanticSurface(title: newTitle, subrole: a.subrole, role: a.role, isMain: a.isMain)
+                guard Windows.reevaluateAdmission(window, semantic) else { return }
+                let changed = window.title != newTitle
+                if changed { window.title = newTitle; window.lastSearchQuery = nil }
+                window.isMainWindow = a.isMain ?? false
+                TrackedWindowStateBridge.dispatch(.titleAndTabsRead(wid: wid, tabGroup: tabObservation,
+                    reconcileTabs: reconcileTabs, changedSoFar: changed))
             }
         }
+    }
+
+    /// A title an app PUSHED through its own AX observer (`AxObserverRegistry.refreshTitle`), applied on the
+    /// same path a read would take. Before this, `kAXTitleChanged` had no equivalent anywhere in the app and
+    /// the title was only as fresh as the last order event or switcher show — the staleness `matchSiblings`
+    /// sees when it compares fresh AX tab titles against model window titles.
+    /// Throttled separately because its rate is chosen by the observed app, not by AltTab's own reads.
+    static func applyObservedTitle(wid: CGWindowID, title: String?) {
+        titleThrottler.throttleOrProceed(key: "\(wid)-title") {
+            guard let window = Windows.byWindowId[wid] else { return }
+            let newTitle = window.bestEffortTitle(title)
+            guard window.title != newTitle else { return }
+            window.title = newTitle
+            window.lastSearchQuery = nil
+            TrackedWindowStateBridge.dispatch(.titleAndTabsRead(wid: wid, tabGroup: .unknown,
+                reconcileTabs: false, changedSoFar: true))
+        }
+    }
+
+    /// Whether each app has ever exposed an `AXTabGroup`, and when each window's tabs were last read against
+    /// which version of its app's window set. `TabReadPolicy` turns the three into a per-show verdict; see
+    /// its Specs for why the blanket per-show read was the wrong size.
+    private static var appSawTabGroup = [pid_t: Bool]()
+    private static var lastTabRead = [CGWindowID: (generation: UInt64, appWindowSetVersion: UInt64)]()
+    private static var tabReadGeneration: UInt64 = 0
+
+    static func forgetTabRead(_ wid: CGWindowID) {
+        lastTabRead[wid] = nil
+    }
+
+    /// Record what a completed tab read learned. Called for every read that actually looked for tabs, so a
+    /// window that answers "no tab group" is as much of an answer as one that answers with tabs.
+    static func noteTabRead(wid: CGWindowID, pid: pid_t, foundTabGroup: Bool, appWindowSetVersion: UInt64? = nil) {
+        // sticky: an app that has shown a tab group once is a tabbing app even while its current windows
+        // happen to have no tabs open
+        appSawTabGroup[pid] = (appSawTabGroup[pid] ?? false) || foundTabGroup
+        tabReadGeneration &+= 1
+        lastTabRead[wid] = (tabReadGeneration, appWindowSetVersion ?? Windows.appWindowSetVersion[pid] ?? 0)
+    }
+
+    private static func tabCapability(_ pid: pid_t) -> AppTabCapability {
+        guard let saw = appSawTabGroup[pid] else { return .unknown }
+        return saw ? .seenTabGroup : .neverSeenTabGroup
     }
 
     /// Re-read the AX-only facts WindowServer can't deliver, for all tracked windows, in case events were
     /// incomplete: title, the main-window flag, and tab siblings. Geometry/fullscreen/minimized are
     /// WindowServer-maintained (806/807 + the tags), so those are NOT re-read or overwritten here.
+    ///
+    /// The TAB half is not asked of every window every time — `TabReadPolicy` picks the few that owe an
+    /// answer. The TITLE half rides along inside `refreshWindowTitleAndTabs`: every window of an app that
+    /// does not push titles, and for an app that does, only the windows the policy elected. So a window this
+    /// pass visits costs one round trip or none.
     static func reviewExistingWindows() {
+        var reviewable = [(Window, CGWindowID, AXUIElement)]()
         for window in Windows.list {
-            guard !window.isWindowlessApp,
-                  let axUiElement = window.axUiElement,
-                  let wid = window.cgWindowId else { continue }
-            refreshWindowTitleAndTabs(axUiElement, wid, window.application)
+            guard !window.isWindowlessApp, let wid = window.cgWindowId, let axUiElement = window.axUiElement
+                else { continue }
+            reviewable.append((window, wid, axUiElement))
+        }
+        let candidates = reviewable.map { window, wid, _ -> TabReadCandidate in
+            let pid = window.application.pid
+            let last = lastTabRead[wid]
+            return TabReadCandidate(wid: wid, capability: tabCapability(pid),
+                appWindowsChangedSinceLastRead: last?.appWindowSetVersion != Windows.appWindowSetVersion[pid] ?? 0,
+                lastReadGeneration: last?.generation)
+        }
+        let readTabsFor = TabReadPolicy.windowsToRead(candidates)
+        Logger.debug { "reviewExistingWindows windows=\(reviewable.count) tabReads=\(readTabsFor.count)" }
+        for (window, wid, axUiElement) in reviewable {
+            refreshWindowTitleAndTabs(axUiElement, wid, window.application, readTabsFor.contains(wid))
         }
     }
 
-    static func addRunningApplications(_ runningApps: [NSRunningApplication], _ needToVerifyFrontmostPid: Bool) {
+    static func addRunningApplications(_ runningApps: [NSRunningApplication]) {
         runningApps.forEach { runningApp in
             let bundleIdentifier = runningApp.bundleIdentifier
-            let processIdentifier = runningApp.processIdentifier
+            guard let processIdentifier = ApplicationPidResolver.resolve(
+                discoveredPid: nil, reportedPid: runningApp.processIdentifier) else { return }
             if bundleIdentifier == "com.apple.dock" {
                 DockEvents.observe(processIdentifier)
             }
@@ -528,36 +1172,54 @@ class Applications {
             guard bundleIdentifier != "com.apple.universalcontrol" else { return }
             // classify off-main (process & sysctl IPC), then create on main if it's a real app (#5721).
             // findOrCreate stays synchronous for the rarer AX-event new-pid path (it re-checks the list).
+            // `thenMain`, so the verdict is recorded on the thread that owns the table.
             ProcessCallScheduler.isActualApplication(processIdentifier, bundleIdentifier) { isActual in
-                if isActual { createActualApp(runningApp) }
+                guard isActual else {
+                    refusedByDiscovery[processIdentifier] = RefusedApplication(bundleId: bundleIdentifier)
+                    return
+                }
+                refusedByDiscovery[processIdentifier] = nil
+                createActualApp(runningApp, processIdentifier)
             }
         }
     }
 
     // The post-classification half of findOrCreate, for the discovery path where classification already
     // ran off-main via ProcessCallScheduler. Runs on main; dedups by pid so it can't race a parallel creation.
-    private static func createActualApp(_ runningApp: NSRunningApplication) {
-        let pid = runningApp.processIdentifier
+    private static func createActualApp(_ runningApp: NSRunningApplication, _ pid: pid_t) {
         guard !(list.contains { $0.pid == pid }) else { return }
-        list.append(Application(runningApp))
+        list.append(Application(runningApp, pid: pid))
     }
 
     static func removeRunningApplications(_ terminatingApps: [NSRunningApplication]) {
         let existingAppsToRemove = list.filter { app in terminatingApps.contains { tApp in app.runningApplication.isEqual(tApp) } }
         let existingWindowstoRemove = Windows.list.filter { window in terminatingApps.contains { tApp in window.application.runningApplication.isEqual(tApp) } }
         if existingAppsToRemove.isEmpty && existingWindowstoRemove.isEmpty { return }
+        let pidsToRemove = Set(existingAppsToRemove.map(\.pid) + existingWindowstoRemove.map { $0.application.pid })
         for tApp in terminatingApps {
             let ofQuitApp = Windows.list.filter { $0.application.runningApplication.isEqual(tApp) }
             if !ofQuitApp.isEmpty { Logger.debug { "remove appQuit count=\(ofQuitApp.count) \(ofQuitApp.map { $0.debugId })" } }
             Windows.removeWindows(ofQuitApp, false)
-            // comparing pid here can fail here, as it can be already nil; we use isEqual here to avoid the issue
+            // processIdentifier may already be -1; identity comparison keeps the tracked pid available for cleanup
             list.removeAll { $0.runningApplication.isEqual(tApp) }
         }
-        for tApp in terminatingApps {
-            let pid = tApp.processIdentifier
+        for pid in pidsToRemove {
+            WindowSurfaceInventory.remove(pid: pid)
+            AxObserverRegistry.shared.processExited(pid, generation: AttentionEngine.generation(of: pid))
+            AttentionEngine.processExited(pid)
             AXCallScheduler.shared.removeEntry(key: "pid-\(pid)")
             AXCallScheduler.shared.removeEntries(withPrefix: "pid-\(pid)-")
             AXCallScheduler.shared.removeUnresponsivePid(pid)
+            appSawTabGroup[pid] = nil
+            lastInactiveTabScan[pid] = nil
+            inactiveTabScanCursor[pid] = nil
+            Windows.forgetAppWindowSetVersion(pid)
+            refusedByDiscovery[pid] = nil
+            ApplicationDiscriminator.forgetProcess(pid)
+            forgetAcquisitionFailures(pid: pid)
+            pendingAxCreations = pendingAxCreations.filter { $0.value.pid != pid }
+            pendingAxEnds = pendingAxEnds.filter { $0.value.pid != pid }
+            Windows.forgetSurfaceRetirements(pid)
         }
         App.refreshOpenUiAfterExternalEvent([])
     }
@@ -571,9 +1233,11 @@ class Applications {
                     let axDockChildren = try AXUIElementCreateApplication(dockPid).attributes([kAXChildrenAttribute]).children,
                     let axListAttrs = (axDockChildren.lazy.compactMap { try? $0.attributes([kAXRoleAttribute, kAXChildrenAttribute]) }.first { $0.role == kAXListRole }),
                     let axListChildren = axListAttrs.children else { return }
-                let axAppDockItemUrlAndLabel: [(URL?, String?)] = try axListChildren.compactMap {
-                    let a = try $0.attributes([kAXSubroleAttribute, kAXIsApplicationRunningAttribute, kAXURLAttribute, kAXStatusLabelAttribute])
-                    guard a.subrole == kAXApplicationDockItemSubrole && (a.appIsRunning ?? false) else { return nil }
+                // `try?` per item, deliberately: one Dock tile that fails to answer skips itself rather than
+                // aborting the whole badge refresh.
+                let axAppDockItemUrlAndLabel: [(URL?, String?)] = axListChildren.compactMap {
+                    guard let a = try? $0.attributes([kAXSubroleAttribute, kAXIsApplicationRunningAttribute, kAXURLAttribute, kAXStatusLabelAttribute]),
+                          a.subrole == kAXApplicationDockItemSubrole, a.appIsRunning ?? false else { return nil }
                     return (a.url, a.statusLabel)
                 }
                 guard !axAppDockItemUrlAndLabel.isEmpty else { return }
@@ -588,8 +1252,8 @@ class Applications {
     static func refreshBadges_(_ items: [(URL?, String?)]) {
         Windows.list.enumerated().forEach { (i, window) in
             let view = TilesView.recycledViews[i]
-            if let app = findOrCreate(window.application.pid, false) {
-                if app.runningApplication.activationPolicy == .regular,
+            if let app = findOrCreate(window.application.pid) {
+                if app.activationPolicy == .regular,
                    let matchingItem = (items.first { $0.0 == app.bundleURL }),
                    let label = matchingItem.1 {
                     app.dockLabel = label
@@ -602,19 +1266,34 @@ class Applications {
         }
     }
 
+    static func knownPid(_ runningApp: NSRunningApplication) -> pid_t? {
+        let trackedPid = list.first { $0.runningApplication.isEqual(runningApp) }?.pid
+        return ApplicationPidResolver.resolve(discoveredPid: trackedPid, reportedPid: runningApp.processIdentifier)
+    }
+
     @discardableResult
-    static func findOrCreate(_ pid: pid_t, _ needToVerifyFrontmostPid: Bool) -> Application? {
-        if let app = (list.first { $0.pid == pid }) {
-            return app
-        }
+    static func findOrCreate(_ pid: pid_t, evidence: ApplicationAdmissionEvidence = .discovery) -> Application? {
+        if let app = (list.first { $0.pid == pid }) { return app }
+        // A WindowServer row can name pid 0 (no owner). Asking LaunchServices about it fails 1,078 times a
+        // pass and can never do anything else.
+        guard pid > 0 else { return nil }
         guard let runningApp = NSRunningApplication(processIdentifier: pid) else {
             Logger.debug { "NSRunningApplication init failed for pid:\(pid)" }
             return nil
         }
-        guard ApplicationDiscriminator.isActualApplication(pid, runningApp.bundleIdentifier) else {
+        // Asked with the bundle id in hand, so a reused pid misses and is classified properly. The lookup
+        // above is a LaunchServices read AppKit already caches; what the refusal saves is the process and
+        // sysctl IPC below.
+        guard !ApplicationVerdictCache.refusalStillAnswers(refusedByDiscovery[pid],
+                  bundleId: runningApp.bundleIdentifier, evidence: evidence) else { return nil }
+        guard ApplicationDiscriminator.isActualApplication(pid, runningApp.bundleIdentifier, evidence: evidence) else {
+            if evidence == .discovery {
+                refusedByDiscovery[pid] = RefusedApplication(bundleId: runningApp.bundleIdentifier)
+            }
             return nil
         }
-        let app = Application(runningApp)
+        refusedByDiscovery[pid] = nil
+        let app = Application(runningApp, pid: pid)
         list.append(app)
         return app
     }
