@@ -94,7 +94,7 @@ appcastItem() {
       <title>Version $version</title>
       <pubDate>$(LC_ALL=C date +'%a, %d %b %Y %H:%M:%S %z')</pubDate>
       <sparkle:minimumSystemVersion>$minimumSystemVersion</sparkle:minimumSystemVersion>
-      <sparkle:releaseNotesLink>https://github.com/$repo/releases/tag/$tag</sparkle:releaseNotesLink>
+      <description><![CDATA[$(releaseNotesHtml)]]></description>
       <enclosure
         url="https://github.com/$repo/releases/download/$tag/AltTab-$version.zip"
         sparkle:version="$version"
@@ -105,9 +105,21 @@ appcastItem() {
 ITEM
 }
 
+upstreamVersion() {
+  [[ $version =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+$ ]] && echo "${BASH_REMATCH[1]}" || echo "$version"
+}
+
+# Inline notes for Sparkle's update window: a releaseNotesLink to the GitHub page renders the whole site there.
+releaseNotesHtml() {
+  local upstream; upstream=$(upstreamVersion)
+  printf '<h3>AltTab %s</h3><p>Every former Pro feature free. Based on upstream AltTab ' "$version"
+  printf '<a href="https://github.com/lwouis/alt-tab-macos/releases/tag/v%s">v%s</a>; ' "$upstream" "$upstream"
+  printf 'what changed there is in the <a href="https://github.com/%s/blob/%s/changelog.md">changelog</a>.</p>' "$repo" "$tag"
+  printf '<p><a href="https://github.com/%s/releases/tag/%s">Release page</a></p>' "$repo" "$tag"
+}
+
 releaseNotes() {
-  local upstream=$version
-  [[ $version =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+$ ]] && upstream=${BASH_REMATCH[1]}
+  local upstream; upstream=$(upstreamVersion)
   printf 'AltTab %s with every former Pro feature free. Signed with Developer ID and notarized by Apple.\n\n' "$version"
   printf 'Based on upstream [v%s](https://github.com/lwouis/alt-tab-macos/releases/tag/v%s); its changes are in [changelog.md](https://github.com/%s/blob/%s/changelog.md).\n\n' "$upstream" "$upstream" "$repo" "$tag"
   printf 'Install: download `AltTab-%s.zip`, unzip, move AltTab.app to /Applications. Later versions arrive through the built-in updater.\n' "$version"
