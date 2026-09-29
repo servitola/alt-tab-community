@@ -8,6 +8,7 @@ IDEWorkspaceChecks.plist
 /DerivedData/
 /build/
 /vendor/*/.build/
+/vendor/*/build/
 /vendor/*/.swiftpm/
 /vendor/*/Package.resolved
 .DS_Store
