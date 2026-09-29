@@ -379,76 +379,35 @@ class FeedbackWindow: NSWindow {
         let cancelButton = alert.addButton(withTitle: NSLocalizedString("Cancel", comment: ""))
         cancelButton.keyEquivalent = "\u{1b}" // Escape
         if alert.runModal() != .alertFirstButtonReturn { return }
-        beginSubmitting()
-        // Capture the kind that owns this submission. If the user navigates to the other kind
-        // form while the POST is in flight, completion still clears the right draft slot.
-        let submittedKind = kind
-        URLSession.shared.dataTask(with: prepareRequest()) { [weak self] data, response, error in
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            let succeeded = status == 201 && error == nil
-            if !succeeded {
-                Logger.error { "feedback POST failed. status:\(status) response:\(response) error:\(error) data:\(data.flatMap { String(data: $0, encoding: .utf8) })" }
-            }
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.endSubmitting()
-                if succeeded {
-                    self.drafts[submittedKind] = nil
-                    // If the user is still on the form they submitted, also clear the on-screen
-                    // textareas so the visible state matches the now-empty draft.
-                    if self.formIsVisible && self.kind == submittedKind {
-                        self.issueTitle.stringValue = ""
-                        self.body.stringValue = ""
-                    }
-                    self.close()
-                } else {
-                    self.showSubmitFailureAlert()
-                }
-            }
-        }.resume()
+        guard let url = issueUrl() else { return }
+        NSWorkspace.shared.open(url)
+        drafts[kind] = nil
+        issueTitle.stringValue = ""
+        body.stringValue = ""
+        close()
     }
 
-    private func beginSubmitting() {
-        isSubmitting = true
-        sendButton.isEnabled = false
-        sendButton.title = NSLocalizedString("Sending…", comment: "")
-    }
-
-    private func endSubmitting() {
-        isSubmitting = false
-        sendButton.title = NSLocalizedString("Create GitHub issue", comment: "")
-        checkEmptyFields()
-    }
-
-    private func showSubmitFailureAlert() {
-        // If the user already dismissed the window before the failure came back, skip the alert —
-        // surprising them with a modal on a closed-feeling window is worse than swallowing it. The
-        // draft is already preserved in `drafts`, so they'll see their text again on next reopen.
-        guard isVisible else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = NSLocalizedString("Couldn't submit feedback", comment: "")
-        alert.informativeText = NSLocalizedString("The server didn't accept the submission. Check your internet connection and try again — your draft is preserved.", comment: "")
-        alert.addButton(withTitle: NSLocalizedString("OK", comment: ""))
-        alert.runModal()
-    }
-
-    /// The backend owns the final GitHub issue presentation — we just hand it the raw
-    /// pieces. Splitting `body` from `debugProfile` means the markdown layout (quoting,
-    /// `<details>` wrapping, disclaimer) can change server-side without forcing every
-    /// installed AltTab to update.
-    private func prepareRequest() -> URLRequest {
-        var request = URLRequest(url: URL(string: Endpoints.feedbackUrl)!)
-        request.httpMethod = "POST"
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.addValue("application/json", forHTTPHeaderField: "Accept")
-        request.httpBody = try! JSONSerialization.data(withJSONObject: [
-            "title": issueTitle.stringValue,
-            "body": body.stringValue,
-            "kind": kind.apiValue,
-            "debugProfile": DebugProfile.make(),
-        ])
-        return request
+    /// This fork has no feedback backend (upstream's lives on alt-tab.app), so the form opens a prefilled
+    /// "new issue" page of this repository and the person submits it there, signed in as themselves.
+    private func issueUrl() -> URL? {
+        // github.com refuses long request URLs: measured 2026-09-29, a 4 KB query opens the form, 8 KB drops the
+        // connection, 16 KB answers 414. The person's own text is never cut; the debug profile gives way.
+        let maxUrlLength = 7000
+        let fullProfile = DebugProfile.make()
+        var keep = fullProfile.count
+        while true {
+            let issueBody = body.stringValue + "\n\n<details><summary>Debug profile</summary>\n\n```\n" + fullProfile.prefix(keep) + "\n```\n</details>\n"
+            var components = URLComponents(string: Endpoints.newIssueUrl)
+            components?.queryItems = [
+                URLQueryItem(name: "title", value: issueTitle.stringValue),
+                URLQueryItem(name: "body", value: issueBody),
+                URLQueryItem(name: "labels", value: kind.apiValue),
+            ]
+            guard let url = components?.url else { return nil }
+            let excess = url.absoluteString.count - maxUrlLength
+            if excess <= 0 || keep == 0 { return url }
+            keep = max(0, keep - excess)
+        }
     }
 
     override func close() {
