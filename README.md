@@ -50,7 +50,13 @@ A one-time migration even **restores the preferences the trial-expiry lock had s
 
 ## Download
 
-Grab `AltTab-<version>.zip` from [Releases](https://github.com/servitola/alt-tab-community/releases/latest), unzip it and move `AltTab.app` to `/Applications`. Requires macOS 12 or later. Updates arrive by themselves (Settings → General → Updates policy); every one is checked against this repository's signing key before it installs.
+With Homebrew:
+
+```sh
+brew install --cask servitola/tap/alt-tab-community
+```
+
+Or grab `AltTab-<version>.zip` from [Releases](https://github.com/servitola/alt-tab-community/releases/latest), unzip it and move `AltTab.app` to `/Applications`. Requires macOS 12 or later. Updates arrive by themselves (Settings → General → Updates policy); every one is checked against this repository's signing key before it installs.
 
 Coming from the original AltTab or an earlier community build? Quit it first. Your preferences carry over.
 

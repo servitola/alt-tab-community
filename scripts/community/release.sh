@@ -4,6 +4,7 @@
 #   scripts/community/release.sh 11.8.0          # a merge of upstream v11.8.0
 #   scripts/community/release.sh 11.8.0.1        # a community fix on top of it
 #   DRY_RUN=1 scripts/community/release.sh 11.8.0  # build, sign and verify only; nothing leaves the machine
+#   POST_RELEASE_HOOK=path/to/script …            # run after publishing, with the version as $1 (a Homebrew tap bump, say)
 #
 # Signing happens on the maintainer's Mac on purpose: CI would need the Developer ID private key as a
 # GitHub secret. Needs, once per machine:
@@ -138,3 +139,4 @@ fi
 notarize
 publish
 echo "release: https://github.com/$repo/releases/tag/$tag"
+if [ -n "${POST_RELEASE_HOOK:-}" ]; then "$POST_RELEASE_HOOK" "$version"; fi
