@@ -12,7 +12,7 @@
 
 </div>
 
-This repository continues [TroopJostle/alt-tab-community](https://github.com/TroopJostle/alt-tab-community): it keeps merging new [upstream AltTab](https://github.com/lwouis/alt-tab-macos) releases, and ships builds that are signed with a Developer ID, notarized by Apple, and kept up to date by the built-in updater.
+This repository is a fork of [upstream AltTab](https://github.com/lwouis/alt-tab-macos) that grew out of [TroopJostle/alt-tab-community](https://github.com/TroopJostle/alt-tab-community): it merges every new upstream release and whatever TroopJostle adds, following [MERGE-POLICY.md](MERGE-POLICY.md), and ships builds that are signed with a Developer ID, notarized by Apple, and kept up to date by the built-in updater.
 
 ---
 
