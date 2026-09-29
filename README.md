@@ -8,7 +8,11 @@
 
 *Every "Pro" feature. Freed. Forever.*
 
+**[⬇ Download the latest signed build](https://github.com/servitola/alt-tab-community/releases/latest)**
+
 </div>
+
+This repository continues [TroopJostle/alt-tab-community](https://github.com/TroopJostle/alt-tab-community): it keeps merging new [upstream AltTab](https://github.com/lwouis/alt-tab-macos) releases, and ships builds that are signed with a Developer ID, notarized by Apple, and kept up to date by the built-in updater.
 
 ---
 
@@ -43,6 +47,12 @@ And ripped out, root and branch:
 - Pro-feature usage tracking
 
 A one-time migration even **restores the preferences the trial-expiry lock had silently downgraded on people**, then wipes the license data from disk. What was taken, given back.
+
+## Download
+
+Grab `AltTab-<version>.zip` from [Releases](https://github.com/servitola/alt-tab-community/releases/latest), unzip it and move `AltTab.app` to `/Applications`. Requires macOS 12 or later. Updates arrive by themselves (Settings → General → Updates policy); every one is checked against this repository's signing key before it installs.
+
+Coming from the original AltTab or an earlier community build? Quit it first. Your preferences carry over.
 
 ## Build it yourself (as free software intends)
 
