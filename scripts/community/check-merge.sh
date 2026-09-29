@@ -31,10 +31,12 @@ hits=$(grep -rnE --include='*.swift' "$removed" src 2>/dev/null | grep -vE '^[^:
 $hits"
 
 before=$failures
+# Only what the fork already had before this merge has to survive it.
 for path in src/switcher/state/DisplaySelectionResolver.swift scripts/community/release.sh MERGE-POLICY.md; do
-  [ -e "$path" ] || fail "fork file missing: $path"
+  git cat-file -e "$base:$path" 2>/dev/null && [ ! -e "$path" ] && fail "fork file missing: $path"
 done
-grep -q 'preferredScreen' src/switcher/state/Screens.swift || fail "Screens.swift lost preferredScreen"
+git show "$base:src/switcher/state/Screens.swift" 2>/dev/null | grep -q preferredScreen \
+  && ! grep -q preferredScreen src/switcher/state/Screens.swift && fail "Screens.swift lost preferredScreen"
 for probe in 'src/api/Endpoints.swift:appcastUrl' 'Info.plist:SUPublicEDKey'; do
   file=${probe%%:*} key=${probe#*:}
   was=$(git show "$base:$file" 2>/dev/null | grep -A1 "$key" | tr -d '[:space:]')
