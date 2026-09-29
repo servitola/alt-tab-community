@@ -37,10 +37,11 @@ for path in src/switcher/state/DisplaySelectionResolver.swift scripts/community/
 done
 git show "$base:src/switcher/state/Screens.swift" 2>/dev/null | grep -q preferredScreen \
   && ! grep -q preferredScreen src/switcher/state/Screens.swift && fail "Screens.swift lost preferredScreen"
-for probe in 'src/api/Endpoints.swift:appcastUrl' 'Info.plist:SUPublicEDKey'; do
-  file=${probe%%:*} key=${probe#*:}
-  was=$(git show "$base:$file" 2>/dev/null | grep -A1 "$key" | tr -d '[:space:]')
-  now=$(grep -A1 "$key" "$file" | tr -d '[:space:]')
+# file:key:lines — how many lines after the key hold its value (a plist value sits on the next line).
+for probe in 'src/api/Endpoints.swift:appcastUrl:0' 'Info.plist:SUPublicEDKey:1'; do
+  IFS=: read -r file key after <<<"$probe"
+  was=$(git show "$base:$file" 2>/dev/null | grep -A"$after" "$key" | tr -d '[:space:]')
+  now=$(grep -A"$after" "$key" "$file" | tr -d '[:space:]')
   [ "$was" = "$now" ] || fail "$key in $file changed from $base"
 done
 [ "$failures" = "$before" ] && pass "fork features and update feed intact"
