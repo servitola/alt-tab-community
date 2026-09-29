@@ -14,6 +14,18 @@
     <title>AltTab Community</title>
     <language>en</language>
     <item>
+      <title>Version 11.8.0.1</title>
+      <pubDate>Tue, 29 Sep 2026 15:21:20 +0300</pubDate>
+      <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+      <description><![CDATA[<h3>AltTab 11.8.0.1</h3><p>Every former Pro feature free. Based on upstream AltTab <a href="https://github.com/lwouis/alt-tab-macos/releases/tag/v11.8.0">v11.8.0</a>; what changed there is in the <a href="https://github.com/servitola/alt-tab-community/blob/community-11.8.0.1/changelog.md">changelog</a>.</p><p><a href="https://github.com/servitola/alt-tab-community/releases/tag/community-11.8.0.1">Release page</a></p>]]></description>
+      <enclosure
+        url="https://github.com/servitola/alt-tab-community/releases/download/community-11.8.0.1/AltTab-11.8.0.1.zip"
+        sparkle:version="11.8.0.1"
+        sparkle:shortVersionString="11.8.0.1"
+        sparkle:edSignature="3FicrNYiCyVrC8GgsPrwxsybQp4cuBxNVECEkznEObveYRraFDJNQKcIPZzoMFZAPnH8ZyG8s/T9SJObAHfLCA==" length="5251550"
+        type="application/octet-stream"/>
+    </item>
+    <item>
       <title>Version 11.8.0</title>
       <pubDate>Tue, 29 Sep 2026 12:06:19 +0300</pubDate>
       <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
