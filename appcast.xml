@@ -7,11 +7,35 @@
   upstream (lwouis/alt-tab-macos) build can never be offered here.
 
   Items are added by scripts/community/release.sh, newest first, right after <language>.
+    <item>
+      <title>Version 11.8.0</title>
+      <pubDate>Tue, 29 Sep 2026 12:06:19 +0300</pubDate>
+      <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+      <sparkle:releaseNotesLink>https://github.com/servitola/alt-tab-community/releases/tag/community-11.8.0</sparkle:releaseNotesLink>
+      <enclosure
+        url="https://github.com/servitola/alt-tab-community/releases/download/community-11.8.0/AltTab-11.8.0.zip"
+        sparkle:version="11.8.0"
+        sparkle:shortVersionString="11.8.0"
+        sparkle:edSignature="r3hoqRkPyO2USFPfL67jclfh2hgCSv12fvA9R+kWLFmNxFhQmeIlABRE38c2qZC0Ix8qFDnGy1MzXq6uhln5BA==" length="5256351"
+        type="application/octet-stream"/>
+    </item>
   Do not copy items from upstream's appcast: their signatures belong to upstream's key.
 -->
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
     <title>AltTab Community</title>
     <language>en</language>
+    <item>
+      <title>Version 11.8.0</title>
+      <pubDate>Tue, 29 Sep 2026 12:06:19 +0300</pubDate>
+      <sparkle:minimumSystemVersion>12.0</sparkle:minimumSystemVersion>
+      <sparkle:releaseNotesLink>https://github.com/servitola/alt-tab-community/releases/tag/community-11.8.0</sparkle:releaseNotesLink>
+      <enclosure
+        url="https://github.com/servitola/alt-tab-community/releases/download/community-11.8.0/AltTab-11.8.0.zip"
+        sparkle:version="11.8.0"
+        sparkle:shortVersionString="11.8.0"
+        sparkle:edSignature="r3hoqRkPyO2USFPfL67jclfh2hgCSv12fvA9R+kWLFmNxFhQmeIlABRE38c2qZC0Ix8qFDnGy1MzXq6uhln5BA==" length="5256351"
+        type="application/octet-stream"/>
+    </item>
   </channel>
 </rss>
