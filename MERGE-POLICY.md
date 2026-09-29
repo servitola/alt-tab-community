@@ -1,7 +1,8 @@
 # Merging an upstream AltTab release
 
 This fork takes every release of [lwouis/alt-tab-macos](https://github.com/lwouis/alt-tab-macos) and ships it
-without the paid tier. This file is the rulebook for that merge, for people and for the agent that does most
+without the paid tier, and also takes what [TroopJostle/alt-tab-community](https://github.com/TroopJostle/alt-tab-community)
+adds (see the last section). This file is the rulebook for that merge, for people and for the agent that does most
 of it unattended. The worked example is the v11.8.0 merge (`48588223`); when a rule here is unclear, look at
 what that commit did.
 
@@ -55,6 +56,18 @@ The fork removed these, and they stay removed however upstream reshapes them:
   `AppearanceTab`, `Screens`, `ScreensEvents`, `PreferencesEvents`, `MacroPreferences`.
 - The focus fix in `SkyLight.framework.swift` (`3e638464`).
 - `scripts/community/`, `MERGE-POLICY.md`, the CI guard `if: github.repository == 'lwouis/alt-tab-macos'`.
+
+## Merging TroopJostle/alt-tab-community
+
+This fork grew out of [TroopJostle/alt-tab-community](https://github.com/TroopJostle/alt-tab-community), which
+removes the paid tier too. New commits on its `master` are merged the same way (one merge commit, same gates) and
+released as the next build on top of the current upstream version: 11.8.0.1, 11.8.0.2, …
+
+- Their bug fixes, Pro removals and features: take them.
+- Where they decided differently from this file, this file wins: the update feed and key, the default update
+  policy, the free search hint, `appcast.xml`, `README.md`, `scripts/community/`.
+- If they merged an upstream release in their own way, keep the resolution that follows this policy and changes
+  fewer upstream lines.
 
 ## Before the merge counts as done
 
