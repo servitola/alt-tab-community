@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Static gates for an upstream merge (see MERGE-POLICY.md). Run from the repository root, after conflicts are
-# resolved and before or after the merge is committed.
+# Static gates for an upstream merge (see MERGE-POLICY.md). Run inside the checkout being merged, after
+# conflicts are resolved and before or after the merge is committed. The script itself may live elsewhere.
 #
 #   scripts/community/check-merge.sh v11.8.0 [base]
 #
 # base is what the merge started from (default: HEAD, or HEAD^1 once the merge is committed). Prints every
 # failure, exits non-zero if there was one. The build, tests and binary checks live in the caller and release.sh.
 set -uo pipefail
-cd "$(dirname "$0")/../.."
+tools=$(cd "$(dirname "$0")" && pwd)
+cd "$(git rev-parse --show-toplevel)" || exit 1
 
 tag="${1:?usage: scripts/community/check-merge.sh <upstream-tag> [base]}"
 if [ -n "${2:-}" ]; then base=$2
@@ -54,7 +55,7 @@ project=alt-tab-macos.xcodeproj/project.pbxproj
 if plutil -lint -s "$project"; then pass "project file parses"; else fail "project file does not parse"; fi
 scratch=$(mktemp -d)
 cp "$project" "$scratch/before"
-python3 scripts/community/prune-pbxproj.py >/dev/null
+python3 "$tools/prune-pbxproj.py" >/dev/null
 if cmp -s "$scratch/before" "$project"; then pass "project file has no stale references"
 else fail "project file had stale references (prune-pbxproj.py has now removed them; commit that)"; fi
 missing=$(git ls-files 'src/*.swift' | while read -r f; do grep -q "path = \"\{0,1\}$(basename "$f")\"\{0,1\};" "$project" || echo "$f"; done)
