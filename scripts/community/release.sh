@@ -132,7 +132,7 @@ publish() {
   git push -q "$remote" "$tag"
   gh release create "$tag" "$zip" -R "$repo" --title "AltTab $version (community)" --notes "$(releaseNotes)"
   appcastItem > "$buildDir/item.xml"
-  sed -i '' -e "/<language>/r $buildDir/item.xml" appcast.xml
+  sed -i '' -e "/<language>.*<\/language>/r $buildDir/item.xml" appcast.xml
   xmllint --noout appcast.xml
   git add appcast.xml
   git commit -q -m "chore(release): community $version"
