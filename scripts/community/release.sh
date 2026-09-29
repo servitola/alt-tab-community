@@ -43,9 +43,8 @@ preflight() {
     || fail "config/local.xcconfig must set CODE_SIGN_IDENTITY to a Developer ID Application identity"
   grep -q "<sparkle:version>$version<\|sparkle:version=\"$version\"" appcast.xml && fail "$version is already in appcast.xml"
   [ -n "$dryRun" ] && return
-  [ "$(git branch --show-current)" = master ] || fail "release from master"
   git fetch -q "$remote"
-  [ "$(git rev-parse HEAD)" = "$(git rev-parse "$remote/master")" ] || fail "master is not in sync with $remote/master"
+  [ "$(git rev-parse HEAD)" = "$(git rev-parse "$remote/master")" ] || fail "HEAD is not $remote/master; release exactly what is published"
   git rev-parse -q --verify "refs/tags/$tag" >/dev/null && fail "tag $tag exists"
   gh release view "$tag" -R "$repo" >/dev/null 2>&1 && fail "release $tag exists on $repo"
   xcrun notarytool history --keychain-profile "$notaryProfile" >/dev/null || fail "notary profile '$notaryProfile' is missing"
@@ -136,7 +135,7 @@ publish() {
   xmllint --noout appcast.xml
   git add appcast.xml
   git commit -q -m "chore(release): community $version"
-  git push -q "$remote" master
+  git push -q "$remote" HEAD:master
 }
 
 preflight
