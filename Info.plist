@@ -44,9 +44,9 @@
 
 	<!-- ===== Sparkle (auto-update framework — reads these directly from the bundle) ===== -->
 	<key>SUPublicEDKey</key>
-	<string>2e9SQOBoaKElchSa/4QDli/nvYkyuDNfynfzBF6vJK4=</string>
+	<string>fxT2sz7rJXsSUxJkaA3W0SHcvJkvS5Apm6s4F+QuGCA=</string>
 	<key>SUEnableAutomaticChecks</key>
-	<string>false</string>
+	<string>true</string>
 	<key>SUScheduledCheckInterval</key>
 	<string>604800</string>
 

@@ -1,24 +1,17 @@
 <?xml version="1.0" standalone="yes"?>
 <!--
-  Intentionally empty.
+  Update feed for servitola/alt-tab-community builds.
 
-  This fork does not ship Sparkle updates. `SUPublicEDKey` in Info.plist is upstream's
-  (lwouis/alt-tab-macos) EdDSA public key, and we don't hold the matching private key, so
-  no build produced from this repository could ever pass Sparkle's signature check.
+  Every <enclosure> points at a release asset of this repository and carries an EdDSA signature made
+  with the key whose public half is SUPublicEDKey in Info.plist. Sparkle rejects anything else, so an
+  upstream (lwouis/alt-tab-macos) build can never be offered here.
 
-  Previously this file was a verbatim copy of upstream's appcast: every <enclosure> pointed at
-  github.com/lwouis/alt-tab-macos/releases/..., so "Install Update" would have silently replaced
-  a community build with a stock upstream one. An empty channel makes Sparkle report
-  "you're up to date" (SUAppcastDriver falls through to didNotFindUpdate when no item is newer),
-  which is the correct answer for this fork.
-
-  Do not repopulate this file from upstream. If this fork ever ships its own signed releases,
-  generate a NEW EdDSA keypair, replace SUPublicEDKey, and write entries pointing at this
-  repository's own release assets.
+  Items are added by scripts/community/release.sh, newest first, right after <language>.
+  Do not copy items from upstream's appcast: their signatures belong to upstream's key.
 -->
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
-    <title>alt-tab-community</title>
+    <title>AltTab Community</title>
     <language>en</language>
   </channel>
 </rss>
