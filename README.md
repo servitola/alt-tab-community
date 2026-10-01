@@ -81,6 +81,10 @@ Fork it. Study it. Share it. That's the whole point of the license it ships unde
 
 The original AltTab is the excellent work of [**lwouis** and its many contributors](https://github.com/lwouis/alt-tab-macos) — 7.4M downloads and 15K stars of genuinely good software. This community fork exists to keep that spirit **free**, in every sense of the word. All credit to them for the app; this repo just refuses the paywall.
 
+Tearing the fences down was the work of [**TroopJostle**](https://github.com/TroopJostle/alt-tab-community), who cut out the licensing stack, unlocked every Pro feature and wrote the manifesto above, with contributions from [toadharvard](https://github.com/toadharvard) and [nixdan](https://github.com/nixdan). Their commits live on in this repository's history under their own names.
+
+What [servitola](https://github.com/servitola) adds on top is upkeep: merging each upstream release, signing and notarizing the builds, running the update feed and the Homebrew cask. The Developer ID on the binary names who built and published it, not who wrote the app.
+
 ## License
 
 [**GNU General Public License v3.0**](LICENCE.md). It was free before, it's free now, and copyleft makes sure it stays free for whoever gets it next. Take it. It's yours.
