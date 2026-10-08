@@ -320,6 +320,31 @@ enum WindowEventReducer {
         [.discoverWindow(wid: wid)]
     }
 
+    /// The same hold `spaceMembershipChanged` gives a tracked tab leaving its Space, for one that left while
+    /// still untracked: its discovery lands in the gap before its replacement's, and without the hold the
+    /// window shows no tile until then (`testATabBackgroundedBeforeItsDiscoveryLandsJoinsTheGroup`).
+    private static func holdThroughDiscoveryIfReplaced(_ state: inout TrackedWindowState,
+                                                       wid: CGWindowID) -> [ReducerEffect] {
+        guard let window = state.window(wid), !anotherTabIsHeld(state, window),
+              TabGroupResolver.shouldHoldVisibleThroughDiscovery(
+                  isTabbed: state.isTabbed(window), becomesSpaceless: true,
+                  hadRecentWindowCreate: state.now - state.carried.lastWindowCreatedAt < recentPairingWindow,
+                  hadRecentUntrackedSpaceJoin:
+                      state.now - state.carried.lastUntrackedVisibleSpaceJoinAt < recentPairingWindow) else { return [] }
+        state.held.insert(wid)
+        return [.log("hold-visible #\(wid) (removed before discovery)"), .scheduleHoldReleaseCheck(wid: wid, attempt: 0)]
+    }
+
+    /// A hold keeps ONE tile through a handover. A Cmd+T burst backgrounds several tabs before any of them is
+    /// grouped, and holding each drew one tile per held tab until the group formed
+    /// (`testASecondTabBackgroundedBeforeDiscoveryIsNotHeldBesideTheFirst`). Tabs of one window share its size.
+    private static func anotherTabIsHeld(_ state: TrackedWindowState, _ window: TrackedWindow) -> Bool {
+        guard let size = window.size else { return false }
+        return state.held.contains { wid in
+            wid != window.wid && state.window(wid).map { $0.pid == window.pid && $0.size == size } ?? false
+        }
+    }
+
     /// Closing the window that holds MRU slot 0 hands the front to whoever held slot 1 — which can belong to
     /// a DIFFERENT app than the one still frontmost. macOS never moves focus across apps because a window
     /// closed, so re-front the frontmost app's own next window instead. Without this, a dialog that took slot
@@ -356,6 +381,11 @@ enum WindowEventReducer {
         effects += inheritHeldGroupAtAttention(&state, target: target)
         effects += applyFocusAndBump(&state, wid: target, at: at, .attentionReducer)
         normalizeGroupVisibility(&state, into: &effects)
+        // A detach animation can leave alpha zero cached after the window becomes key. Attention invalidates
+        // the in-flight visibility read, so request its replacement without inventing an opaque alpha.
+        if state.window(target)?.alpha == 0 {
+            effects.append(.queryWindowServerState(wids: [target]))
+        }
         return effects
     }
 
@@ -847,6 +877,23 @@ enum WindowEventReducer {
 
     // MARK: - async read results landing
 
+    /// **A window admitted before its discovery landed has never had its Space observed.** Exact attention
+    /// (`Windows.findOrCreateCandidate`) tracks a window from its WindowServer row alone, so this landing is
+    /// not `newlyTracked` and the newly-tracked branch never records the membership it just read. Left
+    /// `.unavailable`, a close the app confirms is read as out of the query's scope and the window is kept
+    /// until the WindowServer retires its surface, which a macOS 26 Finder delays past 30s
+    /// (`testAWindowAdmittedOnAttentionLearnsItsSpaceWhenDiscoveryLands`).
+    private static func recordFirstSpaceMembership(_ state: inout TrackedWindowState, wid: CGWindowID, pid: pid_t,
+                                                   spaceMembership: SpaceMembershipObservation,
+                                                   isOrderedIn: Bool) -> [ReducerEffect] {
+        guard let i = state.windowIndex(wid), state.windows[i].spaceMembershipObservation == .unavailable,
+              let queried = spaceMembership.spaceIds else { return [] }
+        state.windows[i].spaceMembershipObservation = spaceMembership
+        guard !queried.isEmpty || !isOrderedIn else { return [] }
+        let r = state.applyWindowSpaces(wid, spaceIds: queried)
+        return [.updateScreenId(wid)] + (r.unphantomedRealWindow ? [.removeWindowlessPlaceholder(pid: pid)] : [])
+    }
+
     /// The apply-side of `Applications.addDiscoveredWindow`, after the shell acquired/discriminated the
     /// window and applied its raw AX/WS attributes. Decisions owned here: the pending-removal consume, the
     /// MRU promotion (was `Windows.appendWindow`'s), the Space override for background tabs, the tab-state
@@ -971,9 +1018,13 @@ enum WindowEventReducer {
             // order event ever fires for those — so tab-grouping's "an on-screen window is nobody's
             // background tab" rule would be unarmed exactly at cold start, which is when a whole desktop of
             // same-frame windows is discovered at once. Forced false for a tab we already know is in the
-            // background, like its Space below.
+            // background, like its Space below, and for a window the WindowServer ordered out after that row
+            // was read. A Space removal can precede the per-window order-out subscription at startup;
+            // either event invalidates the snapshot (`testATabBackgroundedBeforeItsDiscoveryLandsJoinsTheGroup`).
             if let i = state.windowIndex(wid) {
                 state.windows[i].isOrderedIn = isOrderedIn && !adoptedAsInactiveTab
+                    && !wasRemovedFromSpaceWhileUntracked
+                    && !state.carried.offScreen.contains(wid)
                 state.windows[i].spaceMembershipObservation = spaceMembership
             }
             // Override Window.init's current-Space default with the real Space resolved off-main (new
@@ -986,11 +1037,23 @@ enum WindowEventReducer {
                 let r = state.applyWindowSpaces(wid, spaceIds: [])
                 effects.append(.updateScreenId(wid))
                 if r.unphantomedRealWindow { effects.append(.removeWindowlessPlaceholder(pid: window.pid)) }
+                if wasRemovedFromSpaceWhileUntracked, !adoptedAsInactiveTab {
+                    effects.append(contentsOf: holdThroughDiscoveryIfReplaced(&state, wid: wid))
+                }
             } else if let queriedSpaceIds, !queriedSpaceIds.isEmpty || !isOrderedIn {
                 let r = state.applyWindowSpaces(wid, spaceIds: queriedSpaceIds)
                 effects.append(.updateScreenId(wid))
                 if r.unphantomedRealWindow { effects.append(.removeWindowlessPlaceholder(pid: window.pid)) }
             }
+        } else if !adoptedAsInactiveTab {
+            effects.append(contentsOf: recordFirstSpaceMembership(&state, wid: wid, pid: window.pid,
+                spaceMembership: spaceMembership, isOrderedIn: isOrderedIn))
+        }
+        // A window created at 0x0 and sized a millisecond later: the resize reached us while the wid was still
+        // untracked, and no later event re-reads the frame, so the window kept 0x0 and its capture never
+        // matched (`testADiscoveryWithNoFrameAsksTheWindowServerForOne`).
+        if let i = state.windowIndex(wid), !(state.windows[i].size.map { $0.width > 0 && $0.height > 0 } ?? false) {
+            effects.append(.queryWindowServerState(wids: [wid]))
         }
         var tabStateChanged = false
         if tabTitles != nil || state.groups.siblingWids(of: wid) != nil {
@@ -1229,10 +1292,15 @@ enum WindowEventReducer {
     /// dissolves a fullscreen tab group. Re-capture only on-screen windows: a window that just ordered out
     /// can't be screenshotted (a capture grabs a torn-down/blank "skeleton"), so keep its last on-screen
     /// frame and just refresh the layout for the geometry change.
+    /// 4 re-reads at `recheckInterval` (0.4s): longer than any window animation measured.
+    static let transparentRereadLimit = 4
+
     private static func windowServerStateRead(_ state: inout TrackedWindowState, _ snapshots: [WsWindowSnapshot]) -> [ReducerEffect] {
         var changedAny = false
         var toCapture = [CGWindowID]()
         var focusRepairs = [ReducerEffect]()
+        // Returned whether or not anything changed: a window still transparent on its re-read changed nothing.
+        var rereads = [CGWindowID]()
         for snap in snapshots {
             guard let i = state.windowIndex(snap.wid) else { continue }
             var changed = state.windows[i].position != snap.position || state.windows[i].size != snap.size
@@ -1267,6 +1335,19 @@ enum WindowEventReducer {
                 state.windows[i].alpha = snap.alpha
                 changed = true
             }
+            // On screen and fully transparent is how a window looks for the length of an animation: Finder
+            // fades the window a tab is dragged out of, and no event reports the fade ending. Read once, the
+            // value stayed, and the torn-out window was hidden as a phantom (macOS 27.0.1, 2026-10-05). An
+            // invisible reminder window stays transparent, so the re-reads are bounded.
+            if snap.isVisible, snap.alpha == 0 {
+                let done = state.carried.transparentRereads[snap.wid, default: 0]
+                if done < transparentRereadLimit {
+                    state.carried.transparentRereads[snap.wid] = done + 1
+                    rereads.append(snap.wid)
+                }
+            } else {
+                state.carried.transparentRereads[snap.wid] = nil
+            }
             // Both writes above feed the phantom verdict, so the derived flag can flip here — and a flip with
             // no placeholder effect is #5849 in one direction or the other.
             if state.isPhantom(state.windows[i]) != wasPhantom, !state.windows[i].isWindowlessApp {
@@ -1298,8 +1379,9 @@ enum WindowEventReducer {
                 if snap.isVisible { toCapture.append(snap.wid) }
             }
         }
-        guard changedAny else { return [] }
-        var effects = focusRepairs + reconcile(&state)
+        let later: [ReducerEffect] = rereads.isEmpty ? [] : [.queryWindowServerStateLater(wids: rereads)]
+        guard changedAny else { return later }
+        var effects = focusRepairs + reconcile(&state) + later
         effects.append(.refreshUi(wids: toCapture, onlyWhileSwitcherOpen: true))
         return effects
     }
@@ -1451,6 +1533,7 @@ enum WindowEventReducer {
         // just inside that window, so it must not conclude from silence.
         switch TabGroupResolver.dragOutVerdict(joiner: state.tabWindow(window),
                                                previousRepresentative: state.tabWindow(prevRep),
+                                               groupMembers: Set(state.groups.membersByGroup[gid] ?? []),
                                                pairingWindowElapsed: attempt > 0) {
         case .some(true):
             var effects: [ReducerEffect] = [.log("dragOut confirmed #\(wid) left the group of #\(previousRepWid)")]
@@ -1558,10 +1641,16 @@ enum WindowEventReducer {
             // it can't see is NOT evidence of departure (absence of a signal, not a signal of absence —
             // unlike the AX-titles path, whose kept-rule accounts for every member). Union the geometry
             // group with the existing memberships of its members, so re-linking a subset never drops the
-            // unseen rest of the group.
+            // unseen rest of the group. A link to a window shown at another frame is not followed
+            // (`TabGroupResolver.isShownElsewhere`).
             var wids = [group.visibleWid] + background
+            let visibleTab = state.window(group.visibleWid).map { state.tabWindow($0) }
             for w in wids {
-                for m in state.groups.siblingWids(of: w) ?? [] where !wids.contains(m) { wids.append(m) }
+                for m in state.groups.siblingWids(of: w) ?? [] where !wids.contains(m) {
+                    if let visibleTab, let member = state.window(m),
+                       TabGroupResolver.isShownElsewhere(state.tabWindow(member), than: visibleTab) { continue }
+                    wids.append(m)
+                }
             }
             let formed = state.formGroup(wids, representative: group.visibleWid, reason: "geometry")
             effects.append(contentsOf: formed.logs.map { .log($0) })

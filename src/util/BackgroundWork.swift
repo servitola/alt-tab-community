@@ -14,14 +14,14 @@ class BackgroundWork {
     static var screenshotsQueue: LabeledOperationQueue!
     static var accessibilityCommandsQueue: LabeledOperationQueue!
     static var crashReportsQueue: LabeledOperationQueue!
-    static var permissionsCheckOnTimerQueue: LabeledOperationQueue!
+    static var permissionsCheckQueue: LabeledOperationQueue!
     static var permissionsSystemCallsQueue: LabeledOperationQueue!
 
     private static var totalPotentialThreadCount = 0
 
     static func preStart() {
-        // we make calls to the system permissions API to know if permissions are granted. We do this on a timer
-        permissionsCheckOnTimerQueue = LabeledOperationQueue("permissionsCheckOnTimer", .userInteractive, 1)
+        // we make calls to the system permissions API to know if permissions are granted, at launch and when tccd reports a change
+        permissionsCheckQueue = LabeledOperationQueue("permissionsCheck", .userInteractive, 1)
         // if macOS is overwhelmed, let's reduce the pressure on it by calling permission APIs one at a time
         permissionsSystemCallsQueue = LabeledOperationQueue("permissionsSystemCalls", .userInteractive, 1)
         // we update cachedSCWindows during the first permission check; so we need this queue early
@@ -39,7 +39,7 @@ class BackgroundWork {
         // we main Mission Control state on a background thread. We protect reads from main-thread with an NSLock
         missionControlThread = BackgroundThreadWithRunLoop("missionControl", .userInteractive)
         // we listen to CLI commands (CFMessagePort events)
-        cliEventsThread = BackgroundThreadWithRunLoop("cliMessages", .userInteractive)
+        if cliEventsThread == nil { cliEventsThread = BackgroundThreadWithRunLoop("cliMessages", .userInteractive) }
         // ONE runloop for every app's AXObserver, however many apps are running. Per-app runloops would put
         // the thread budget in each user's app count; per-window sources are what leaked in #5612.
         axSemanticsThread = BackgroundThreadWithRunLoop("axSemantics", .userInteractive)

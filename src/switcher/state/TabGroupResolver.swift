@@ -767,11 +767,13 @@ enum TabGroupResolver {
         // group, and `form` is exact-set, so naming the one sibling the token happened to reach would EJECT
         // its other members — a real window's tile split off from the group it never left (generator seed 18,
         // where composed titles name nobody and only the two most recent tabs had ever been read as active).
-        // Nothing here re-decides their membership: they are grouped already, and a member that genuinely
-        // left is taken out by its own signal, never by this one's silence.
+        // An on-screen representative is protected on this indirect claim too: it may be a detached window
+        // whose old background tabs still carry the group's token. A new-tab creation keeps the outgoing
+        // representative through the handover, as on the direct token claim above.
         let tokenGroupWids = sameAppWindows.filter { s in
             s.wid != active.wid && !matchedWids.contains(s.wid)
                 && s.tabbedSiblingWids?.contains(where: { tokenWids.contains($0) }) == true
+                && (activeIsNewlyDiscovered || s.isTabbed || !s.isOrderedIn)
         }.map { $0.wid }
         matchedWids.append(contentsOf: tokenGroupWids)
         let keptWids = sameAppWindows.filter { s in
@@ -897,15 +899,21 @@ enum TabGroupResolver {
     /// (a background tab gets no geometry events, so a moved window leaves them frozen at the old frame),
     /// while the outgoing active was live on-screen at the moment of the join. Fullscreen is excluded —
     /// frames are unreliable there, and the fullscreen Space rule (`membersThatLeftGroup`) owns departures.
+    /// `groupMembers`: the joiner's group as it stands when the verdict is asked. The representative recorded
+    /// at the join can be a background tab: a group whose tabs all share one title ("Recents") is formed
+    /// before the visible tab is matched, and geometry folds that tab in only after the join. The joiner
+    /// replaced that visible tab, so a replaced wid that is a member now is a switch too.
     static func dragOutVerdict(joiner: TabWindow, previousRepresentative: TabWindow,
-                               pairingWindowElapsed: Bool = false) -> Bool? {
+                               groupMembers: Set<CGWindowID> = [], pairingWindowElapsed: Bool = false) -> Bool? {
         if joiner.isFullscreen || previousRepresentative.isFullscreen { return false }
         // THE HANDOVER ANSWERS IT DIRECTLY, and the frames never could. A tab SWITCH is a join MATCHED by the
         // outgoing tab's leave on that Space; a drag-OUT is a join with no leave, because the parent's active
         // tab never went anywhere. Both legs must stay ahead of the frame test below, which can only guess:
         // a dragged-out tab starts at its parent's frame, so dropping one back over its parent reads as a
         // switch, and "same frame" also says stop checking. The window then stayed in the group, hidden.
-        if let replaced = joiner.replacedWid { return replaced != previousRepresentative.wid }
+        if let replaced = joiner.replacedWid {
+            return replaced != previousRepresentative.wid && !groupMembers.contains(replaced)
+        }
         // The absence of a leave is only evidence once the pairing window has passed — before that the 1326
         // may simply be in flight (it is routinely the later of the two, `fullscreenTabSwitchEvents`). The
         // caller owns that clock: `dragOutCheck` re-fires on a timer and knows how long it has been.
@@ -1005,6 +1013,18 @@ enum TabGroupResolver {
     private static func sameFrame(_ a: TabWindow, _ b: TabWindow) -> Bool {
         guard sizesMatch(a, b), let pa = a.position, let pb = b.position else { return false }
         return samePosition(pa, pb)
+    }
+
+    /// Is `member` a separate window the WindowServer is showing at another frame than `visible`? A tabbed
+    /// window draws one tab at a time, at one frame, so such a member is not `visible`'s tab whatever the
+    /// group links say. Links can be wrong: a background tab keeps the origin its window had when the tab was
+    /// created, and that can be another window's origin now, so adoption can file it under that window
+    /// (`testALinkToAWindowShownElsewhereIsNotFollowedIntoTheGroup`). Fullscreen frames are unreliable and
+    /// stay undecided, as does a member with no known frame.
+    static func isShownElsewhere(_ member: TabWindow, than visible: TabWindow) -> Bool {
+        guard !member.isFullscreen, !visible.isFullscreen, member.isOrderedIn, hasGenuineSpace(member),
+              member.position != nil, visible.position != nil else { return false }
+        return !sameFrame(member, visible)
     }
 
     /// Which members have LEFT this group and must be unlinked — separate windows still carrying a stale

@@ -118,7 +118,7 @@ class Windows {
         // reactively on WindowServer events (TabGroup.reconcile), so the model is already grouped here —
         // doing it in this synchronous show path would reorder tiles mid-render (UI jump).
         for window in list {
-            refreshIfWindowShouldBeShownToTheUser(window, filters)
+            window.shouldShowTheUser = shouldShowTheUser(window, filters)
         }
         refreshWhichWindowsToShowTheUser()
         sort()
@@ -149,14 +149,27 @@ class Windows {
         }
     }
 
-    private static func refreshIfWindowShouldBeShownToTheUser(_ window: Window, _ f: WindowFilters) {
+    /// The app owning the frontmost window drawn at `point`, read from the WindowServer's on-screen list
+    /// rather than guessed from focus order: activating an app raises all its windows while only one of them
+    /// gains focus, so a window the user sees on top can be older in focus order than the one it covers.
+    static func pidUnderCursor(_ point: CGPoint) -> pid_t? {
+        let windows = CGWindow.windows(.optionOnScreenOnly).compactMap { w -> OnScreenWindow? in
+            guard let pid = w.ownerPID(), let layer = w.layer(), let bounds = w.bounds() else { return nil }
+            return OnScreenWindow(pid: pid, layer: layer, alpha: w.alpha() ?? 1, bounds: bounds)
+        }
+        return WindowFilterResolver.pidUnderCursor(point, windows)
+    }
+
+    static func shouldShowTheUser(_ window: Window, _ f: WindowFilters) -> Bool {
         // `isOnPreferredScreen` is the one irreducibly OS-coupled fact (touches `Spaces.screenSpacesMap` +
         // multi-screen quartz math); passed as `@autoclosure` so it's only evaluated if the cheaper
         // filters above don't already exclude the window.
-        window.shouldShowTheUser = WindowFilterResolver.shouldShow(
+        WindowFilterResolver.shouldShow(
             window.state, window.application.state,
             onlyFrontmostApp: f.appsToShow == .active,
             excludeFrontmostApp: f.appsToShow == .nonActive,
+            onlyUnderCursor: f.appsToShow == .underCursor,
+            onlyAppUnderCursor: f.appsToShow == .appUnderCursor,
             hideHidden: f.showHiddenWindows == .hide,
             hideWindowless: f.showWindowlessApps == .hide,
             hideFullscreen: f.showFullscreenWindows == .hide,
@@ -166,9 +179,11 @@ class Windows {
             onlyPreferredScreen: f.screensToShow == .showingAltTab,
             separateTabs: f.groupTabs == .separateWindows,
             frontmostPid: Applications.frontmostPid,
+            pidUnderCursor: f.pidUnderCursor,
             visibleSpaceIds: Spaces.visibleSpaces,
             exceptions: f.exceptions,
-            isOnPreferredScreen: window.isOnScreen(NSScreen.preferred))
+            isOnPreferredScreen: window.isOnScreen(NSScreen.preferred),
+            isUnderCursor: f.cursor.map { window.contains($0) } ?? false)
     }
 
     /// selection + hover methods (all operate on `SwitcherSession.current`)
@@ -518,19 +533,20 @@ class Windows {
         }
     }
 
-    /// reordered list based on preferences, keeping the original index
     private static func sort() {
-        let trimmedQuery = Search.normalizedQuery((SwitcherSession.current?.searchQuery ?? ""))
+        // Raw, as `shouldDisplay` passes it: smart-case reads its uppercase letters, and `Search` caches per raw query.
+        let query = SwitcherSession.current?.searchQuery ?? ""
+        let normalizedQuery = Search.normalizedQuery(query)
         let shortcutIndex = (SwitcherSession.current?.shortcutIndex ?? 0)
         // Hoisted once per sort: locals are captured by the comparator closure so each of the
         // O(n log n) comparisons reads them directly.
-        let searchActive = !trimmedQuery.isEmpty
+        let searchActive = !normalizedQuery.isEmpty
         let windowlessAtEnd = Preferences.showWindowlessApps(shortcutIndex) == .showAtTheEnd
         let hiddenAtEnd = Preferences.showHiddenWindows(shortcutIndex) == .showAtTheEnd
         let minimizedAtEnd = Preferences.showMinimizedWindows(shortcutIndex) == .showAtTheEnd
         let sortType = orderSortType(Preferences.windowOrder(shortcutIndex))
         // Precompute each window's ordering facts once (O(n) Search calls), then sort on the snapshots.
-        let facts = Dictionary(uniqueKeysWithValues: list.map { (ObjectIdentifier($0), orderWindow($0, trimmedQuery)) })
+        let facts = Dictionary(uniqueKeysWithValues: list.map { (ObjectIdentifier($0), orderWindow($0, query, searchActive)) })
         list.sort {
             WindowOrderResolver.isOrderedBefore(
                 facts[ObjectIdentifier($0)]!, facts[ObjectIdentifier($1)]!,
@@ -542,12 +558,12 @@ class Windows {
         }
     }
 
-    private static func orderWindow(_ window: Window, _ query: String) -> OrderWindow {
+    private static func orderWindow(_ window: Window, _ query: String, _ searchActive: Bool) -> OrderWindow {
         OrderWindow(
             state: window.state,
             app: window.application.state,
-            searchMatches: query.isEmpty ? false : Search.matches(window, query: query),
-            searchRelevance: query.isEmpty ? 0 : Search.relevance(for: window, query: query))
+            searchMatches: searchActive ? Search.matches(window, query: query) : false,
+            searchRelevance: searchActive ? Search.relevance(for: window, query: query) : 0)
     }
 
     private static func orderSortType(_ p: WindowOrderPreference) -> OrderSortType {
@@ -655,7 +671,9 @@ class Windows {
             existing.admissionEvidence = .attention
             return existing
         }
-        let decision = WindowAdmissionResolver.resolve(PhysicalSurface(raw), nil, evidence: .attention)
+        guard !isOwnUntitledSurface(raw) else { return nil }
+        let decision = WindowAdmissionResolver.resolve(PhysicalSurface(raw), nil, evidence: .attention,
+            describedSiblings: describedSurfaces(pid: raw.pid))
         guard decision.isDestination else {
             logAdmission(decision, raw, app)
             return nil
@@ -663,9 +681,38 @@ class Windows {
         let window = Window(nil, app, raw.wid, raw.title.isEmpty ? nil : raw.title,
             WsWindowState.isFullscreen(raw), WsWindowState.isMinimized(raw),
             raw.bounds.origin, raw.bounds.size, .attentionCandidate, .attention)
+        // `Window.init` assumes the current Space. Attention can name a tab that a later tab already sent to
+        // the background (a Cmd+T burst resolves focus late), and that guess then read as on-screen evidence,
+        // so the tab matcher refused to keep it in its group and it stood as a second tile for good.
+        if !WsWindowState.isVisible(raw) && !WsWindowState.isMinimized(raw) { window.updateSpacesAndScreen([:]) }
         appendWindow(window)
         logAdmission(decision, raw, app)
         return window
+    }
+
+    /// AltTab's own popovers read level 0 for the first frames of their show, before AppKit raises them to the
+    /// status bar level, and attention can name them in that gap. Admitted then, a closed popover stayed in the
+    /// list for seconds. AppKit answers for our own surfaces directly: only a titled one is a window.
+    private static func isOwnUntitledSurface(_ raw: WsRawWindow) -> Bool {
+        guard raw.pid == ProcessInfo.processInfo.processIdentifier,
+              let window = NSApp.window(withWindowNumber: Int(raw.wid)) else { return false }
+        return !window.styleMask.contains(.titled)
+    }
+
+    /// The app's described windows as the model holds them: the model follows each window's moves and Space
+    /// changes as they arrive, where the inventory only refreshes a row on a full scan or a targeted query.
+    private static func describedSurfaces(pid: pid_t) -> [PhysicalSurface] {
+        list.compactMap { window in
+            guard window.application.pid == pid, window.axUiElement != nil, let wid = window.cgWindowId,
+                  let position = window.position, let size = window.size else { return nil }
+            return PhysicalSurface(wid: wid, pid: pid, bounds: CGRect(origin: position, size: size),
+                level: WindowAdmissionResolver.normalLevel, isVisible: isShowing(window),
+                isMinimized: window.isMinimized, isFullscreen: window.isFullscreen && !window.isFullscreenMirrored)
+        }
+    }
+
+    private static func isShowing(_ window: Window) -> Bool {
+        !window.isMinimized && !window.isHidden && window.spaceIds.contains { Spaces.visibleSpaces.contains($0) }
     }
 
     /// **Attention buys time for accessibility to catch up. This is where the loan is called in.**
@@ -872,7 +919,7 @@ enum WindowActivityType: Int {
     case focus = 2
 }
 
-/// Snapshot of per-shortcut preferences used by `refreshIfWindowShouldBeShownToTheUser`. The
+/// Snapshot of per-shortcut preferences used by `Windows.shouldShowTheUser`. The
 /// `Preferences.<arrayPref>` getters each rebuild a `[MacroPreference]` array via N×`macroPref`
 /// calls — cheap once, dominant when read inside a per-window loop. Snapshotting once at the
 /// start of `updatesBeforeShowing` collapses N_windows × M_prefs accesses into M_prefs.
@@ -886,18 +933,40 @@ struct WindowFilters {
     let spacesToShow: SpacesToShowPreference
     let screensToShow: ScreensToShowPreference
     let groupTabs: GroupTabsPreference
+    /// Only read for the two cursor scopes; `nil` otherwise.
+    let cursor: CGPoint?
+    let pidUnderCursor: pid_t?
 
     static func snapshot() -> WindowFilters {
         let i = SwitcherSession.current?.shortcutIndex ?? 0
+        let appsToShow = Preferences.appsToShow[i]
+        let cursor = appsToShow == .underCursor || appsToShow == .appUnderCursor ? cursorAtSummon() : nil
         return WindowFilters(
             exceptions: Preferences.exceptions,
-            appsToShow: Preferences.appsToShow[i],
+            appsToShow: appsToShow,
             showHiddenWindows: Preferences.showHiddenWindows[i],
             showWindowlessApps: Preferences.showWindowlessApps[i],
             showFullscreenWindows: Preferences.showFullscreenWindows[i],
             showMinimizedWindows: Preferences.showMinimizedWindows[i],
             spacesToShow: Preferences.spacesToShow[i],
             screensToShow: Preferences.screensToShow[i],
-            groupTabs: Preferences.groupTabs(i))
+            groupTabs: Preferences.groupTabs(i),
+            cursor: cursor,
+            pidUnderCursor: appsToShow == .appUnderCursor ? cursor.flatMap { pidUnderCursorAtSummon($0) } : nil)
+    }
+
+    /// Outside a session (the QA snapshot of a closed switcher) there is no press to refer to, so the pointer
+    /// is read now.
+    private static func cursorAtSummon() -> CGPoint? {
+        guard let session = SwitcherSession.current else { return CGEvent(source: nil)?.location }
+        return session.cursorAtSummon
+    }
+
+    private static func pidUnderCursorAtSummon(_ cursor: CGPoint) -> pid_t? {
+        guard let session = SwitcherSession.current else { return Windows.pidUnderCursor(cursor) }
+        if let pid = session.pidUnderCursorAtSummon { return pid }
+        let pid = Windows.pidUnderCursor(cursor)
+        session.pidUnderCursorAtSummon = .some(pid)
+        return pid
     }
 }

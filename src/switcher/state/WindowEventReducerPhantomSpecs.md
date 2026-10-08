@@ -71,6 +71,7 @@ the shortcut straight away, and the switcher is built while the stale verdict st
 was just focused. A committed attention decision is proof the window is real, so the verdict is cleared at
 that moment instead of waiting for a pass (`TrackedWindowState.clearPhantomOnFocus`).
 
+- **testAttentionRefreshesAlphaWithoutAssumingTheWindowIsOpaque** — attention on a window cached at alpha zero requests a fresh WindowServer read. It preserves the cached value until that read answers, so a genuinely transparent window stays phantom.
 - **testAttentionClearsAStalePhantomLatch** — a latched-phantom window attention lands on is real
   immediately.
 - **testAttentionUnphantomingEmitsRemoveWindowlessPlaceholder** — that un-phantoming also drops the app's
@@ -109,3 +110,16 @@ at all for that app, then finally the closed-app icon.
 - **testPhantomWithAnotherRealWindowLeftEmitsNoAdd** — one window of several turning phantom leaves the app
   something to show, so no placeholder (the duplicate tile, in the other direction).
 - **testUnphantomingEmitsNoAdd** — the opposite edge never adds one.
+
+### F. A window read on screen and fully transparent is read again
+
+On screen and at alpha 0 is how a window looks for the length of an animation: Finder fades the window a tab
+is dragged out of, and no event reports the fade ending. Read once mid-fade, the value stayed, and the
+torn-out window was hidden as a phantom (macOS 27.0.1). An invisible reminder stays transparent, so the
+re-reads are bounded.
+
+- **testAWindowOnScreenAndFullyTransparentIsReadAgain** — a visible snapshot at alpha 0 schedules a later
+  WindowServer read of that window.
+- **testTheReReadsOfATransparentWindowAreBounded** — after `transparentRereadLimit` re-reads, no more.
+- **testAnOpaqueReadResetsTheBound** — an opaque read clears the count.
+- **testATransparentWindowOffScreenIsNotReadAgain** — off screen, alpha 0 is not an animation in progress.

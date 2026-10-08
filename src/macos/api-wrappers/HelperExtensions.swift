@@ -48,18 +48,6 @@ extension NSColor {
         NSColor(name: nil) { $0.isDarkMode ? dark : light }
     }
 
-    class var tableBorderColor: NSColor {
-        dynamicAppearanceColor(
-            light: NSColor(srgbRed: 229 / 255, green: 229 / 255, blue: 229 / 255, alpha: 0.8),  // #e5e5e5
-            dark: NSColor(srgbRed: 75 / 255, green: 75 / 255, blue: 75 / 255, alpha: 0.8))       // #4b4b4b
-    }
-
-    class var tableBackgroundColor: NSColor {
-        dynamicAppearanceColor(
-            light: NSColor(srgbRed: 242 / 255, green: 242 / 255, blue: 242 / 255, alpha: 0.8),  // #f2f2f2
-            dark: NSColor(srgbRed: 43 / 255, green: 43 / 255, blue: 43 / 255, alpha: 0.8))       // #2b2b2b
-    }
-
     class var tableSeparatorColor: NSColor {
         dynamicAppearanceColor(
             light: NSColor(srgbRed: 231 / 255, green: 231 / 255, blue: 231 / 255, alpha: 0.8),  // #e7e7e7
@@ -219,19 +207,6 @@ extension NSImage {
 }
 
 extension CGImage {
-    static func allNamed(_ imageName: String) -> [CGImage] {
-        let imageURL = Bundle.main.url(forResource: imageName, withExtension: nil)!
-        let imageSource = CGImageSourceCreateWithURL(imageURL as CFURL, nil)!
-        let count = CGImageSourceGetCount(imageSource)
-        return (0..<count).compactMap { CGImageSourceCreateImageAtIndex(imageSource, $0, nil) }
-    }
-
-    static func bestMatch(_ images: [CGImage], for size: NSSize) -> CGImage {
-        let targetPx = Int(size.width.rounded())
-        return images.filter { $0.width >= targetPx }.min(by: { $0.width < $1.width })
-            ?? images.max(by: { $0.width < $1.width })!
-    }
-
     func size() -> NSSize {
         return NSSize(width: width, height: height)
     }

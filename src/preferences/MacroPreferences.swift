@@ -1,14 +1,23 @@
 enum MenubarIconPreference: CaseIterable, MacroPreference {
+    // Persisted indices and menubar-N.pdf assets share this order; preserve it across icon redesigns.
     case outlined
     case filled
     case colored
+    case legacyOutlined
+    case legacyFilled
+    case legacyColored
+
+    var isTemplate: Bool { self != .colored && self != .legacyColored }
 
     var localizedString: LocalizedString {
         switch self {
-            // these spaces are different from each other; they have to be unique
+            // NSPopUpButton requires unique titles, including the image-only choices.
             case .outlined: return " "
             case .filled: return " "
             case .colored: return " "
+            case .legacyOutlined: return "  "
+            case .legacyFilled: return "  "
+            case .legacyColored: return "  "
         }
     }
 }
@@ -163,12 +172,16 @@ enum AppsToShowPreference: CaseIterable, MacroPreference {
     case all
     case active
     case nonActive
+    case underCursor
+    case appUnderCursor
 
     var localizedString: LocalizedString {
         switch self {
             case .all: return NSLocalizedString("All apps", comment: "")
             case .active: return NSLocalizedString("Active app", comment: "")
             case .nonActive: return NSLocalizedString("Non-active apps", comment: "")
+            case .underCursor: return NSLocalizedString("Windows under the cursor", comment: "")
+            case .appUnderCursor: return NSLocalizedString("App under the cursor", comment: "")
         }
     }
 }

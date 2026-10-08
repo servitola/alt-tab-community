@@ -7,6 +7,35 @@ struct FocusGeneration: RawRepresentable, Hashable, Comparable {
     static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 }
 
+/// **Whether a switch that reported success left another app's window over its target** (#6064). See "Verifying
+/// the result" in FocusIntentPolicySpecs.md.
+struct FocusOutcomePolicy {
+    struct Surface {
+        let wid: CGWindowID
+        let pid: pid_t
+        let layer: Int
+        let bounds: CGRect
+        let alpha: Double
+    }
+
+    /// Re-read at the execution boundary: a native click or Cmd-Tab does not create an AltTab generation.
+    /// Unknown focus and work delayed more than a second are not grounds for moving another window.
+    static func mayRaise(_ targetWid: CGWindowID, _ targetPid: pid_t, frontPid: pid_t?, focusedWid: CGWindowID?,
+                         current: Bool, now: TimeInterval, deadline: TimeInterval) -> Bool {
+        current && now <= deadline && frontPid == targetPid && focusedWid == targetWid
+    }
+
+    static func needsRaise(_ targetWid: CGWindowID, _ targetPid: pid_t, _ frontPid: pid_t?, _ current: Bool,
+                           _ surfaces: [Surface]) -> Bool {
+        guard current, frontPid == targetPid,
+              let targetIndex = surfaces.firstIndex(where: { $0.wid == targetWid }) else { return false }
+        let target = surfaces[targetIndex]
+        return surfaces[..<targetIndex].contains {
+            $0.layer == 0 && $0.alpha > 0 && $0.pid != targetPid && $0.bounds.intersects(target.bounds)
+        }
+    }
+}
+
 /// **Which of several in-flight focus operations may still touch the screen.**
 ///
 /// `Window.focus()` puts the whole activate-key-raise sequence on the shared 4-wide
@@ -73,6 +102,22 @@ struct FocusIntentPolicy {
         guard let awaited, now - awaited.at <= Self.repairHorizon else { return nil }
         return awaited
     }
+
+    /// **Is the read after a switch too early to believe?** The focus calls return before the app has moved its
+    /// key window, so a read that lands first names the window being LEFT, and believing it walks that window
+    /// up the order the way the activation's cached answer would. Measured in a macOS 27 VM (2026-10-04): the
+    /// read 7ms after the switch named Finder's previous window, Finder's own answer naming the target was
+    /// committed 240ms later, and the stale window was left second in the order, above the one the user came
+    /// from.
+    /// An answer naming another window of the awaited app is asked again; one that still names it after
+    /// `earlyAnswerRereads` is the truth, a switch that did not take (#6055).
+    func answeredTooEarly(pid: pid_t, wid: CGWindowID?, attempt: Int, now: TimeInterval) -> Bool {
+        guard let wid, attempt < Self.earlyAnswerRereads, let awaited = awaitedAnswer(now: now) else { return false }
+        return awaited.pid == pid && awaited.wid != wid
+    }
+
+    static let earlyAnswerRereads = 3
+    static let earlyAnswerRereadDelay: TimeInterval = 0.1
 
     /// A focus that this policy cannot re-assert took over: `Window.focus()` also lands on AltTab's own
     /// window and on a windowless app, and neither is a wid this can front. Pending operations still have to
@@ -146,6 +191,10 @@ class FocusIntents {
         withPolicy { $0.heardBack(pid: pid) }
     }
 
+    func answeredTooEarly(pid: pid_t, wid: CGWindowID?, attempt: Int) -> Bool {
+        withPolicy { $0.answeredTooEarly(pid: pid, wid: wid, attempt: attempt, now: ProcessInfo.processInfo.systemUptime) }
+    }
+
     /// Is AltTab still waiting to hear where its own switch into this app landed? See
     /// `FocusIntentPolicy.awaited`.
     func isAwaitingAnswer(from pid: pid_t) -> Bool {
@@ -153,6 +202,50 @@ class FocusIntents {
     }
 
     #if DEBUG
+    private var holdVerificationForQa = false
+    private var heldVerificationForQa: (() -> Void)?
+
+    func holdNextVerificationForQa() {
+        lock.lock()
+        holdVerificationForQa = true
+        lock.unlock()
+    }
+
+    /// Pose the covering window before the snapshot, without racing the production settle delay.
+    func deferVerificationForQa(_ verification: @escaping () -> Void) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard holdVerificationForQa else { return false }
+        holdVerificationForQa = false
+        heldVerificationForQa = verification
+        return true
+    }
+
+    func resumeVerificationForQa() {
+        lock.lock()
+        let verification = heldVerificationForQa
+        heldVerificationForQa = nil
+        holdVerificationForQa = false
+        lock.unlock()
+        verification?()
+    }
+
+    private var verificationDelayForQa = 0
+
+    func delayNextVerificationForQa(_ milliseconds: Int) {
+        lock.lock()
+        verificationDelayForQa = min(800, max(0, milliseconds))
+        lock.unlock()
+    }
+
+    func consumeVerificationDelayForQa() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let delay = verificationDelayForQa
+        verificationDelayForQa = 0
+        return delay
+    }
+
     private var refusalArmedForQa = false
 
     /// **Fault injection (`--qa-refuse-next-focus`): the next focus operation makes none of its OS calls**, as

@@ -188,9 +188,11 @@ class WindowServerEvents {
                 TrackedWindowStateBridge.dispatch(.windowMovedOrResized(wid: w0, inSpaceTransition: inSpaceTransition))
             }
         case .updateSpaceMembership:
+            guard !isOwnWindow(widInSpace) else { return }
             TrackedWindowStateBridge.dispatch(.spaceMembershipChanged(wid: widInSpace, spaceId: space,
                 added: n == .windowAddedToSpace, now: now, inSpaceTransition: inSpaceTransition))
         case .acquireAndDiscriminate:
+            guard !isOwnWindow(w0) else { return }
             TrackedWindowStateBridge.dispatch(.windowCreated(wid: w0, now: now, inSpaceTransition: inSpaceTransition))
         case .spaceTransition:
             // 1329/1401 fire during the transition (manuallyRefreshAllWindows above stays muted ~0.5s to
@@ -200,6 +202,13 @@ class WindowServerEvents {
             Logger.debug { "WS \(n) space=\(space)" }
             scheduleSpaceChangeHandling()
         }
+    }
+
+    /// Our own windows are never tracked, and must not pass for one arriving: a window being created or joining
+    /// the visible Space is what the reducer reads as a new tab on its way (`shouldHoldVisibleThroughDiscovery`),
+    /// and the switcher panel joins every Space the instant it shows.
+    private static func isOwnWindow(_ wid: CGWindowID) -> Bool {
+        NSApp.windows.contains { $0.windowNumber == Int(wid) }
     }
 
     /// Arm the hold-release re-check (the reducer's `scheduleHoldReleaseCheck` effect): the shell owns the
@@ -217,6 +226,12 @@ class WindowServerEvents {
     static func armDragOutCheck(_ wid: CGWindowID, previousRepWid: CGWindowID, attempt: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + recheckInterval) {
             TrackedWindowStateBridge.dispatch(.dragOutCheck(wid: wid, previousRepWid: previousRepWid, attempt: attempt))
+        }
+    }
+
+    static func requeryLater(_ wids: [CGWindowID]) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + recheckInterval) {
+            Applications.updateWindowStatesViaWindowServer(wids)
         }
     }
 
@@ -239,13 +254,13 @@ class WindowServerEvents {
     /// activation, so for an app whose AX focus notifications never arrive this read is the only thing that
     /// says the user moved (`testTwoAltTabsIntoTheSameAppBothMoveTheOrder`). A focus that did not take reads
     /// back the window that kept focus, and the order stays true to the screen (#6055).
-    static func readFocusedWindowAfterFocusing(_ pid: pid_t) {
-        readFocusedWindow(pid, key: "pid-\(pid)-post-focus", viaActivationRead: false)
+    static func readFocusedWindowAfterFocusing(_ pid: pid_t, attempt: Int = 0) {
+        readFocusedWindow(pid, key: "pid-\(pid)-post-focus", viaActivationRead: false, attempt: attempt)
     }
 
     /// A dedicated element carries the measured 250ms cap, so a wedged app can occupy one bounded worker but
     /// never the main thread or the observer runloop.
-    private static func readFocusedWindow(_ pid: pid_t, key: String, viaActivationRead: Bool) {
+    private static func readFocusedWindow(_ pid: pid_t, key: String, viaActivationRead: Bool, attempt: Int = 0) {
         guard Applications.findOrCreate(pid) != nil else { return }
         AXCallScheduler.shared.schedule(key: key, pid: pid) {
             let appAx = AXUIElementCreateApplication(pid)
@@ -254,15 +269,19 @@ class WindowServerEvents {
             // wrappers so an own-process query runs AppKit on main.
             let focused = try? appAx.attributes([kAXFocusedWindowAttribute], pid: pid).focusedWindow
             let wid = focused.flatMap { try? $0.cgWindowId(pid: pid) }
-            DispatchQueue.main.async { focusedWindowAnswered(pid, wid, viaActivationRead) }
+            DispatchQueue.main.async { focusedWindowAnswered(pid, wid, viaActivationRead, attempt) }
         }
     }
 
     /// The read came back. The post-focus one is the answer the pending switch was waiting for, whether or
     /// not the app named a window: a wedged app that cannot answer must not keep the rest of the model
     /// waiting on it either.
-    private static func focusedWindowAnswered(_ pid: pid_t, _ wid: CGWindowID?, _ viaActivationRead: Bool) {
-        if !viaActivationRead { FocusIntents.shared.heardBack(pid: pid) }
+    private static func focusedWindowAnswered(_ pid: pid_t, _ wid: CGWindowID?, _ viaActivationRead: Bool,
+                                              _ attempt: Int) {
+        if !viaActivationRead {
+            guard !readAgainIfTooEarly(pid, wid, attempt) else { return }
+            FocusIntents.shared.heardBack(pid: pid)
+        }
         if let wid {
             return TrackedWindowStateBridge.dispatch(.axFocusedWindowRead(pid: pid, wid: wid,
                 viaActivationRead: viaActivationRead))
@@ -271,6 +290,15 @@ class WindowServerEvents {
         // otherwise keep waiting on it forever.
         guard viaActivationRead else { return }
         TrackedWindowStateBridge.dispatch(.axFocusedWindowReadFailed(pid: pid))
+    }
+
+    /// See `FocusIntentPolicy.answeredTooEarly`.
+    private static func readAgainIfTooEarly(_ pid: pid_t, _ wid: CGWindowID?, _ attempt: Int) -> Bool {
+        guard FocusIntents.shared.answeredTooEarly(pid: pid, wid: wid, attempt: attempt) else { return false }
+        DispatchQueue.main.asyncAfter(deadline: .now() + FocusIntentPolicy.earlyAnswerRereadDelay) {
+            readFocusedWindowAfterFocusing(pid, attempt: attempt + 1)
+        }
+        return true
     }
 
     /// 1329/1401 can fire several times during one Space transition; debounce so the topology refresh + UI

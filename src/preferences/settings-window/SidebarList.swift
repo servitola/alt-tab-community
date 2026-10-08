@@ -74,10 +74,18 @@ class SidebarListContainer: NSView {
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = TableGroupView.cornerRadius
-        layer?.borderWidth = TableGroupView.borderWidth
+        // The layer only clips the content to the card's rounded shape; the native card draws the background.
+        layer?.cornerRadius = TableGroupView.cardCornerRadius
+        layer?.cornerCurve = .continuous
         layer?.masksToBounds = true
-        refreshColors()
+        let card = TableGroupView.makeCard()
+        addSubview(card)
+        NSLayoutConstraint.activate([
+            card.topAnchor.constraint(equalTo: topAnchor),
+            card.leadingAnchor.constraint(equalTo: leadingAnchor),
+            card.trailingAnchor.constraint(equalTo: trailingAnchor),
+            card.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
     }
 
     required init?(coder: NSCoder) {
@@ -96,16 +104,6 @@ class SidebarListContainer: NSView {
         case 125: onArrowKey(.down)
         default: super.keyDown(with: event)
         }
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        refreshColors()
-    }
-
-    private func refreshColors() {
-        layer?.backgroundColor = NSColor.tableBackgroundColor.cgColor
-        layer?.borderColor = NSColor.tableBorderColor.cgColor
     }
 }
 
@@ -301,9 +299,7 @@ class SidebarListRow: ClickHoverStackView {
             backgroundColor = .clear
         }
         titleLabel.font = NSFont.systemFont(ofSize: 13, weight: isSelectedRow ? .semibold : .regular)
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = backgroundColor.cgColor
-        }
+        withDrawingAppearance { layer?.backgroundColor = backgroundColor.cgColor }
         titleLabel.needsDisplay = true
         summaryLabel.needsDisplay = true
         chevronLabel.needsDisplay = true

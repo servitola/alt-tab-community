@@ -596,6 +596,28 @@ final class TabGroupResolverTests: XCTestCase {
         XCTAssertEqual(m.toUntabWids, [], "no member of the group being joined is un-tabbed by joining it")
     }
 
+    func testTokenClaimDoesNotAbsorbTheSiblingsOnScreenRepresentative() {
+        let active = tw(wid: 1, title: "parent", isOrderedIn: true, tabGroupToken: 77)
+        let sibling = tw(wid: 2, spaceIds: [], title: "window title", isTabbed: true,
+                         tabbedSiblingWids: [2, 3], tabGroupToken: 77)
+        let detached = tw(wid: 3, size: CGSize(width: 800, height: 569), position: CGPoint(x: 100, y: 131),
+                          title: "detached", tabbedSiblingWids: [2, 3], isOrderedIn: true, tabGroupToken: 77)
+        let match = TabGroupResolver.matchSiblings(active: active, axTitles: ["parent", "tab title"],
+            sameAppWindows: [active, sibling, detached])
+        XCTAssertEqual(match.siblingWids, [1, 2], "a stale group must not import the detached window indirectly")
+        XCTAssertEqual(match.matchedWids, [2])
+    }
+
+    func testNewTokenClaimIncludesTheOutgoingGroupsOnScreenRepresentative() {
+        let active = tw(wid: 1, size: CGSize(width: 800, height: 569), title: "new", tabGroupToken: 77)
+        let sibling = tw(wid: 2, spaceIds: [], title: "window title", isTabbed: true,
+                         tabbedSiblingWids: [2, 3], tabGroupToken: 77)
+        let outgoing = tw(wid: 3, title: "outgoing", tabbedSiblingWids: [2, 3], isOrderedIn: true)
+        let match = TabGroupResolver.matchSiblings(active: active, axTitles: ["new", "tab one", "tab two"],
+            sameAppWindows: [active, sibling, outgoing], activeIsNewlyDiscovered: true)
+        XCTAssertEqual(match.siblingWids, [1, 2, 3], "a new tab must retain the group during its handover")
+    }
+
     func testTokenDoesNotClaimAnOnScreenWindow() {
         // A token is recorded when a window is read as the selected tab and OUTLIVES that instant, so it can
         // name a window that has since been torn out. Outside a creation the on-screen protection stands:
@@ -809,6 +831,18 @@ final class TabGroupResolverTests: XCTestCase {
         joiner.replacedWid = 9
         let prevRep = tw(wid: 2, spaceIds: [])
         XCTAssertEqual(TabGroupResolver.dragOutVerdict(joiner: joiner, previousRepresentative: prevRep), true)
+    }
+
+    /// Three Finder tabs all titled "Recents": the group was formed from titles before the visible tab was
+    /// matched, so its representative was a background tab. The switch's joiner replaced the visible tab,
+    /// which geometry folded into the group before the check. Read as a drag-out, it split the window into
+    /// two tiles under an open switcher (macOS 15, 2026-10-04).
+    func testAJoinThatReplacedAMemberOfItsOwnGroupIsATabSwitch() {
+        var joiner = tw(wid: 67, spaceIds: [1])
+        joiner.replacedWid = 69
+        let prevRep = tw(wid: 68, size: CGSize(width: 920, height: 436), position: CGPoint(x: 180, y: 101), spaceIds: [])
+        XCTAssertEqual(TabGroupResolver.dragOutVerdict(joiner: joiner, previousRepresentative: prevRep,
+                                                       groupMembers: [67, 68, 69]), false)
     }
 
     // MARK: - dragOutVerdict
