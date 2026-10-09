@@ -46,6 +46,11 @@ for probe in 'src/api/Endpoints.swift:appcastUrl:0' 'Info.plist:SUPublicEDKey:1'
 done
 [ "$failures" = "$before" ] && pass "fork features and update feed intact"
 
+# Only release.sh writes the feed, after the zip it points at is published. An entry carried over from upstream's
+# feed is signed with their key: every user is offered it, downloads it, and Sparkle rejects it, on every check.
+git diff --quiet "$base" -- appcast.xml && pass "appcast.xml untouched by the merge" \
+  || fail "appcast.xml differs from $base: restore it with \`git checkout $base -- appcast.xml\`"
+
 urls=$(git diff "$tag" -- src Info.plist config | grep '^+' | grep -oE 'https?://[^" )<>]+' | sort -u \
   | grep -vE '^https://(raw\.githubusercontent\.com|github\.com)/servitola/alt-tab-community' || true)
 [ -z "$urls" ] && pass "no network endpoints beyond upstream's" || fail "URLs this fork adds on top of $tag:
