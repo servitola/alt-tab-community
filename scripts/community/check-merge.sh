@@ -56,7 +56,8 @@ urls=$(git diff "$tag" -- src Info.plist config | grep '^+' | grep -oE 'https?:/
 [ -z "$urls" ] && pass "no network endpoints beyond upstream's" || fail "URLs this fork adds on top of $tag:
 $urls"
 
-top=$(grep -m1 -oE '^# \[?[0-9]+\.[0-9]+\.[0-9]+' changelog.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+# A patch release is an `##` heading in the changelog upstream generates, a minor or major one `#`.
+top=$(grep -m1 -oE '^#+ \[?[0-9]+\.[0-9]+\.[0-9]+' changelog.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 [ "v$top" = "$tag" ] && pass "changelog is at $tag" || fail "changelog.md starts at $top, not ${tag#v}"
 
 project=alt-tab-macos.xcodeproj/project.pbxproj

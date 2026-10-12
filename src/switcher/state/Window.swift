@@ -62,6 +62,9 @@ class Window {
     var rowIndex: Int?
     var debugId: String!
     var lastSearchQuery: String?
+    /// AX answered this window's last title read, or its discovery, with an empty title
+    /// (`AxTitleNotificationPolicy.pushCoversTitle`).
+    var axTitleIsEmpty = false
     var swAppMatchSpan: Range<Int>?
     var swTitleMatchSpan: Range<Int>?
     var swBestSimilarity = 0.0
@@ -345,7 +348,8 @@ class Window {
         }
     }
 
-    func focus() {
+    /// `onFronted` runs on main once step 1 has fronted the target (see `TilesPanel.orderOutOnceFronted`).
+    func focus(_ onFronted: @escaping () -> Void = {}) {
         MainThreadStall.step()
         if let altTabWindow = altTabWindow() {
             // Our windows are only ordered out when closed, and stay listed until the phantom verdict lands.
@@ -386,7 +390,7 @@ class Window {
                 ? NSWorkspace.shared.frontmostApplication.flatMap(Applications.knownPid) : nil
             let target: FocusTarget = (cgWindowId!, application.pid, axUiElement, self.isMinimized)
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-                self?.applyFocus(target, generation, originSpaceId, originFrontPid)
+                self?.applyFocus(target, generation, originSpaceId, originFrontPid, onFronted)
             }
         }
     }
@@ -411,7 +415,7 @@ class Window {
     /// is therefore skipped once a newer focus exists, and a superseded operation that already moved the
     /// z-order re-asserts the newer intent on its way out — see FocusIntentPolicySpecs.md.
     /// The target is captured on main; AX work cannot read state that the main-thread reducer adopts.
-    private func applyFocus(_ target: FocusTarget, _ generation: FocusGeneration, _ originSpaceId: CGSSpaceID, _ originFrontPid: pid_t?) {
+    private func applyFocus(_ target: FocusTarget, _ generation: FocusGeneration, _ originSpaceId: CGSSpaceID, _ originFrontPid: pid_t?, _ onFronted: @escaping () -> Void) {
         guard FocusIntents.shared.mayProceed(generation) else { return }
         #if DEBUG
         if FocusIntents.shared.consumeRefusalForQa() { return refusedForQa(target.wid, target.pid) }
@@ -427,6 +431,7 @@ class Window {
         GetProcessForPID(target.pid, &psn)
         _SLPSSetFrontProcessWithOptions(&psn, target.wid, SLPSMode.userGenerated.rawValue)
         FocusIntents.shared.noteReordered(generation)
+        DispatchQueue.main.async(execute: onFronted)
         makeKeyAndRaise(target, generation, &psn)
         restoreOriginSpaceFront(originSpaceId, originFrontPid, target.pid)
         repairIfSuperseded(generation, target.wid)
@@ -581,6 +586,15 @@ class Window {
         makeKeyWindow(&psn, intent.wid)
         Logger.debug { "focus repair: re-asserting #\(intent.wid) over the late \(wid)" }
         DispatchQueue.main.async { WindowServerEvents.readFocusedWindowAfterFocusing(intent.pid) }
+    }
+
+    /// The AX title, or the WindowServer's read live when AX has none. Called OFF-main, next to the AX read
+    /// it completes, since it is a WindowServer round trip. Chrome web apps answer AX with an empty title on
+    /// every window, so without it their title is the inventory snapshot's, which is only as fresh as the
+    /// last sweep and lags every rename in between (#6089).
+    static func axOrLiveWindowServerTitle(_ axTitle: String?, _ wid: CGWindowID) -> String? {
+        guard let axTitle, !axTitle.isEmpty else { return wid.title() ?? axTitle }
+        return axTitle
     }
 
     /// For some windows (e.g. Slack) the AX API returns no title, so we fall back to the WindowServer's, and

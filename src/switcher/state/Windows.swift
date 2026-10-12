@@ -161,10 +161,11 @@ class Windows {
     }
 
     static func shouldShowTheUser(_ window: Window, _ f: WindowFilters) -> Bool {
+        guard !window.tracked.isClosingOffScreen(appHidden: window.application.isHidden) else { return false }
         // `isOnPreferredScreen` is the one irreducibly OS-coupled fact (touches `Spaces.screenSpacesMap` +
         // multi-screen quartz math); passed as `@autoclosure` so it's only evaluated if the cheaper
         // filters above don't already exclude the window.
-        WindowFilterResolver.shouldShow(
+        return WindowFilterResolver.shouldShow(
             window.state, window.application.state,
             onlyFrontmostApp: f.appsToShow == .active,
             excludeFrontmostApp: f.appsToShow == .nonActive,
@@ -599,6 +600,7 @@ class Windows {
             // AX answered for a window that had been kept on WindowServer evidence alone.
             promoteVerified(wid)
             window.semanticSurface = semantic
+            window.axTitleIsEmpty = !semantic.hasTitle
             // on any window event, we take the opportunity to refresh all window attributes
             window.updateFromAxAttributes(semantic.title, raw.bounds.size, raw.bounds.origin, isFullscreen, isMinimized)
             logAdmission(decision, raw, app)
@@ -607,6 +609,7 @@ class Windows {
         let window = Window(windowAxUiElement, app, wid, semantic.title, isFullscreen, isMinimized,
             raw.bounds.origin, raw.bounds.size, .axVerified, evidence)
         window.semanticSurface = semantic
+        window.axTitleIsEmpty = !semantic.hasTitle
         appendWindow(window)
         restoreSurfaceContinuity(window, element: windowAxUiElement)
         logAdmission(decision, raw, app)

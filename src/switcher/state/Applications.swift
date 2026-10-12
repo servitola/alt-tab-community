@@ -363,9 +363,9 @@ class Applications {
     /// made a cold-start adoption flood arrive as visible "on-screen" windows that the tab matcher was then
     /// forbidden to claim — a switcher full of ghost tiles that only the NEXT show's re-query healed (rec15).
     /// Forced Space-less, it arrives hidden like any unclaimed background tab, and the group converges below.
-    static func addDiscoveredWindow(_ element: AXUIElement, _ raw: WsRawWindow, _ app: Application,
+    static func addDiscoveredWindow(_ element: AXUIElement, _ discoveredRaw: WsRawWindow, _ app: Application,
                                     adoptedAsInactiveTab: Bool = false) {
-        let wid = raw.wid
+        let wid = discoveredRaw.wid
         AXCallScheduler.shared.schedule(key: "wid-\(wid)-generic", context: app.debugId, pid: app.pid, scan: true) { [weak app] in
             guard let app else { return }
             guard wid != 0 else { return }
@@ -376,6 +376,7 @@ class Applications {
             let keys = [kAXTitleAttribute, kAXSubroleAttribute, kAXRoleAttribute, kAXMainAttribute]
             let a = try element.attributes(keys, pid: app.pid)
             let semantic = SemanticSurface(title: a.title, subrole: a.subrole, role: a.role, isMain: a.isMain)
+            let raw = currentRaw(discoveredRaw)
             let tabObservation: TabGroupObservation = isSelf ? .unknown : element.tabGroupObservation(pid: app.pid)
             let isFullscreen = WsWindowState.isFullscreen(raw)
             // Both from the SAME WindowServer snapshot this discovery already holds. Minimized used to be an
@@ -423,6 +424,15 @@ class Applications {
                 if findOrCreate.1 { Windows.reseedZOrderDuringStartup() }
             }
         }
+    }
+
+    /// **The surface is judged as it is when accessibility describes it, not as it was when the sweep listed
+    /// it.** Chrome keeps its find bar alive while it is closed: ordered out, parentless, and absent from
+    /// accessibility, so the sweep keeps asking for it. Reopened, it is a child of its browser window and
+    /// accessibility answers for it (`AXWindow` titled "Find in page …"), and the row from the sweep still
+    /// read parentless, so it was admitted as a second Chrome window and put in front (#6096).
+    private static func currentRaw(_ raw: WsRawWindow) -> WsRawWindow {
+        WindowServerQuery.query([raw.wid]).first ?? raw
     }
 
     /// WindowServer-driven per-window state refresh (geometry + fullscreen), replacing the AX attribute read
@@ -628,9 +638,11 @@ class Applications {
     private static func finishAxElementEnd(wid: CGWindowID, token: UInt64) {
         guard let pending = pendingAxEnds[wid], pending.token == token, let ax = pending.ax,
               let surfacePresent = pending.surfacePresent else { return }
+        // Read at decision time: the AX destroy can lead the app-hide notification.
+        let appHidden = Windows.byWindowId[wid]?.application.isHidden ?? false
         let verdict = AxElementEndPolicy.decide(ax: ax, surfacePresent: surfacePresent,
             isTabbed: pending.isTabbed, groupShrank: pending.groupShrank, groupGone: pending.groupGone,
-            axQueryCoversWindow: pending.axQueryCoversWindow)
+            axQueryCoversWindow: pending.axQueryCoversWindow, appHidden: appHidden)
         commitAxElementEnd(wid: wid, pending: pending, verdict: verdict)
     }
 
@@ -646,7 +658,8 @@ class Applications {
         // The evidence behind the verdict, so a capture says WHICH fact condemned or kept the window
         Logger.debug { "axEnd #\(wid) verdict=\(verdict) ax=\(pending.ax.map { "\($0)" } ?? "pending") "
             + "surface=\(pending.surfacePresent.map { "\($0)" } ?? "pending") tabbed=\(pending.isTabbed) "
-            + "shrank=\(pending.groupShrank) gone=\(pending.groupGone)" }
+            + "shrank=\(pending.groupShrank) gone=\(pending.groupGone) "
+            + "hidden=\(Windows.byWindowId[wid]?.application.isHidden ?? false)" }
         pendingAxEnds[wid] = nil
         if let fresh = pending.freshElement { Windows.byWindowId[wid]?.rebindAxElement(fresh) }
         if verdict == .confirmedClosed { widsConfirmedClosed.insert(wid) }
@@ -696,9 +709,11 @@ class Applications {
                 // The route reaches the current Space plus the app's key/main window, so it does not cover
                 // an arbitrary other-Space window. It may condemn only when a completed membership
                 // observation puts the window inside that scope; a display value borrowed from a tab or
-                // guessed at initialization is not evidence that the query covered it.
+                // guessed at initialization is not evidence that the query covered it. Nor does a hidden
+                // app's list cover its windows (`AxElementEndPolicy`).
                 let axQueryCoversWindow = Windows.byWindowId[wid].map { window -> Bool in
-                    guard case let .known(ids) = window.spaceMembershipObservation else { return false }
+                    guard !window.application.isHidden,
+                          case let .known(ids) = window.spaceMembershipObservation else { return false }
                     return ids.isEmpty || ids.contains { Spaces.visibleSpaces.contains($0) }
                 } ?? false
                 if !axQueryCoversWindow {
@@ -1042,7 +1057,10 @@ class Applications {
         // re-read too, and the rest ride on the push. Narrow on purpose — the gaps a push leaves are an
         // observer rebuild and an element adopted after the fact, both rare, both corrected within a few
         // summons, against a read that would otherwise cost one round trip per window per summon.
-        guard reconcileTabs || !AxObserverRegistry.deliversTitles(app.pid) else { return }
+        // A window whose AX title is empty gets no push to ride on, so it is read every time.
+        guard reconcileTabs || !AxTitleNotificationPolicy.pushCoversTitle(
+            appDeliversTitles: AxObserverRegistry.deliversTitles(app.pid),
+            axTitleIsEmpty: Windows.byWindowId[wid]?.axTitleIsEmpty ?? false) else { return }
         AXCallScheduler.shared.schedule(key: "wid-\(wid)-generic", context: app.debugId, pid: app.pid, scan: true) { [weak app] in
             guard let app else { return }
             guard wid != 0 else { return }
@@ -1070,6 +1088,7 @@ class Applications {
                 return
             }
             let tabObservation: TabGroupObservation = readTabs ? axWindow.tabGroupObservation(pid: app.pid) : .unknown
+            let title = Window.axOrLiveWindowServerTitle(a.title, wid)
             DispatchQueue.main.async {
                 // This read HAPPENED, and "no tab group" is as much of an answer as a group.
                 if readTabs, tabObservation != .unknown {
@@ -1084,11 +1103,12 @@ class Applications {
                 guard let window = Windows.byWindowId[wid] else { return }
                 // raw-fact ingestion stays here (bestEffortTitle needs the CG-title fallback IPC); the
                 // tab reconcile + re-render decision is the reducer's `.titleAndTabsRead` branch
-                let newTitle = window.bestEffortTitle(a.title)
+                let newTitle = window.bestEffortTitle(title)
                 let semantic = SemanticSurface(title: newTitle, subrole: a.subrole, role: a.role, isMain: a.isMain)
                 guard Windows.reevaluateAdmission(window, semantic) else { return }
                 let changed = window.title != newTitle
                 if changed { window.title = newTitle; window.lastSearchQuery = nil }
+                window.axTitleIsEmpty = a.title?.isEmpty ?? true
                 window.isMainWindow = a.isMain ?? false
                 TrackedWindowStateBridge.dispatch(.titleAndTabsRead(wid: wid, tabGroup: tabObservation,
                     reconcileTabs: reconcileTabs, changedSoFar: changed))
