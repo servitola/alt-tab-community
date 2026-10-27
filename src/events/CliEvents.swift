@@ -101,10 +101,10 @@ class CliServer {
                 }
             )
         }
+        #if DEBUG
         if rawValue == "--qa-state" {
             return qaState()
         }
-        #if DEBUG
         if let reply = QaLifecycle.command(rawValue) { return reply }
         if rawValue.hasPrefix("--qa-defer-repaints=") {
             let ms = Int(rawValue.dropFirst("--qa-defer-repaints=".count)) ?? 0
@@ -133,7 +133,6 @@ class CliServer {
             WindowCaptureScreenshots.dropNextDiscoveryForQa()
             return noOutput
         }
-        #endif
         // The provider timeline, drained rather than read: each record is reported exactly once, so a test
         // gets the events of its own session and not the whole run's backlog. The harness writes them out as
         // NDJSON (`TrackingTelemetryNdjson`).
@@ -174,6 +173,7 @@ class CliServer {
             Logger.info { "QAMARK \(mark)" }
             return noOutput
         }
+        #endif
         if rawValue.hasPrefix("--focus="),
            let id = CGWindowID(rawValue.dropFirst("--focus=".count)), let window = (Windows.list.first { $0.cgWindowId == id }) {
             window.focus()
@@ -204,6 +204,7 @@ class CliServer {
         return error
     }
 
+    #if DEBUG
     /// Read-only snapshot of everything the switcher would decide, without showing the UI. Exists for the
     /// automated runs: a live assertion oracle that costs one IPC round-trip instead of
     /// parsing debug logs or screenshotting tiles. Mutates nothing — `shown` is computed into a local, not
@@ -326,8 +327,11 @@ class CliServer {
                 spaceIcon: icons[StatusIconsView.spaceIdx].visible,
                 dockLabel: badge.isHidden ? nil : badge.text,
                 dockLabelAccessibility: badge.isHidden ? nil : badge.accessibilityLabel(),
+                dockLabelHeight: badge.isHidden ? nil : badge.frame.height,
+                appIconHeight: view.appIcon.frame.height,
                 thumbnailPixelSize: window.thumbnail?.size(),
                 expectedThumbnailPixelSize: expectedThumbnailPixelSize(window),
+                thumbnailSize: view.thumbnail.isHidden ? nil : view.thumbnail.frame.size,
                 x: frame.origin.x, y: frame.origin.y, w: frame.size.width, h: frame.size.height,
                 thumbY: view.thumbnail.frame.origin.y, labelY: view.label.frame.origin.y,
                 row: window.rowIndex ?? -1,
@@ -347,9 +351,10 @@ class CliServer {
     /// The pixel size a thumbnail capture of this window should measure right now, from the same
     /// `capturePixelSize` the capture request is configured with. Reported next to the size the last
     /// capture actually came back with, so a harness can judge the capture path without knowing the
-    /// thumbnail-scale arithmetic.
+    /// thumbnail-scale arithmetic. Sized from the area the last capture covered, which a sheet hanging past
+    /// the window makes larger than the window (`CaptureArea`).
     private static func expectedThumbnailPixelSize(_ window: Window) -> CGSize? {
-        guard let size = window.size else { return nil }
+        guard let size = window.thumbnailArea?.size else { return nil }
         return WindowThumbnails.capturePixelSize(size, WindowThumbnails.captureScaleFactor(window), false)
     }
 
@@ -433,12 +438,19 @@ class CliServer {
         /// (`TileView.getAccessibilityTextForBadge`).
         var dockLabel: String?
         var dockLabelAccessibility: String?
+        /// The badge's drawn height next to the app icon's, so a test can judge the badge against the icon it sits on.
+        var dockLabelHeight: CGFloat?
+        var appIconHeight: CGFloat
         /// The pixel size of the window's last accepted capture (nil: never captured, so the tile shows the
         /// app icon), and the size a capture should come back with now (nil: no window geometry). The
         /// ScreenCaptureKit path is configured with the second, so the two differ by at most a pixel or two
         /// when the capture path works.
         var thumbnailPixelSize: CGSize?
         var expectedThumbnailPixelSize: CGSize?
+        /// The thumbnail as drawn on the tile, in points (nil: thumbnails hidden in this style). Its shape
+        /// should be the capture's: a tile shaped after the window alone while the capture also holds an
+        /// overflowing sheet shows the picture squashed or beside an empty band.
+        var thumbnailSize: CGSize?
         /// **The laid-out geometry, so a test can judge the GRID and not just the list.** The tile's own
         /// frame moves when the row height is wrong (titles / appIcons styles), and the thumbnail's origin
         /// inside it moves when only the label metric is wrong (thumbnails style) — which is the shape of
@@ -520,6 +532,7 @@ class CliServer {
         var size: CGSize?
         var axHash: Int?
     }
+    #endif
 
     private struct JsonWindowList: Codable {
         var windows: [JsonWindow]
@@ -557,9 +570,14 @@ class CliClient {
     static func detectCommand() -> String? {
         let args = CommandLine.arguments
         if args.count == 2 && !args[1].starts(with: "--logs=") {
-            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--qa-state" || args[1] == "--qa-telemetry" || args[1] == "--hide" || args[1].hasPrefix("--qa-mark=") || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
+            if args[1] == "--list" || args[1] == "--detailed-list" || args[1] == "--hide" || args[1].hasPrefix("--focus=") || args[1].hasPrefix("--focusUsingLastFocusOrder=") || args[1].hasPrefix("--show=") {
                 return args[1]
             }
+            #if DEBUG
+            if args[1] == "--qa-state" || args[1] == "--qa-telemetry" || args[1].hasPrefix("--qa-mark=") {
+                return args[1]
+            }
+            #endif
         }
         return nil
     }

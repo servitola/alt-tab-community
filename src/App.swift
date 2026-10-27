@@ -80,6 +80,7 @@ class App: AppCenterApplication {
         MainThreadStall.step()
         Logger.debug { "active:\(SwitcherSession.isActive)" }
         guard SwitcherSession.current != nil else { return false } // already hidden
+        DismissalInput.begin()
         SwitcherSession.current = nil
         // The badge read only runs while a session is open, so once this one closes its quiet period has no
         // next call left to throttle: all it can still do is delay the FIRST read of the next session by up
@@ -97,21 +98,25 @@ class App: AppCenterApplication {
         return true
     }
 
-    /// The rest of the dismissal, none of it visible. Kept behind the focus request because
-    /// `TilesView.endSearchSession` can stall on the OS text-input services (#5981).
+    /// Reset session state now; AppKit cleanup waits until the panel has given the keyboard back.
     private static func endHideUi() {
         MainThreadStall.step()
+        ContextMenuEvents.toggle(false)
+        TrackpadEvents.reset()
+        OnboardingPopover.switcherWasDismissed()
+        TilesPanel.shared.whenOrderedOut(finishHideUi)
+    }
+
+    private static func finishHideUi() {
+        MainThreadStall.step()
         // Two event-server round trips (`tapIsEnabled`, then `tapEnable`), measured at up to 8ms on
-        // macOS 26.6.2. Behind the focus request rather than in front of it: the tap's callback already
-        // passes Esc through once `SwitcherSession.isActive` is false, so nothing absorbs a key in the gap.
+        // macOS 26.6.2. Behind the focus request rather than in front of it: the tap's callback passes Esc
+        // through once `SwitcherSession.isActive` is false. The local monitor discards keys still sent here.
         KeyboardEvents.updateEscapeAbsorptionTap() // session closed: stop tapping keyDown (#5766)
         TilesView.endSearchSession()
-        ContextMenuEvents.toggle(false)
         CursorEvents.toggle(false)
-        TrackpadEvents.reset()
         Tooltips.hideAll()
         MainMenu.toggle(true)
-        OnboardingPopover.switcherWasDismissed()
     }
 
     /// we don't want another window to become key when the TilesPanel is hidden
@@ -178,6 +183,7 @@ class App: AppCenterApplication {
     }
 
     static func showSecondaryWindow(_ window: NSWindow) {
+        DismissalInput.cancel()
         NSScreen.updatePreferred()
         App.shared.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -335,6 +341,7 @@ class App: AppCenterApplication {
 
     static func showUiOrCycleSelection(_ shortcutIndex: Int, _ forceDoNothingOnRelease_: Bool) {
         MainThreadStall.step()
+        if !SwitcherSession.isActive { DismissalInput.cancel() }
         OnboardingPopover.switcherWasSummoned()
         let session = SwitcherSession.current ?? {
             let new = SwitcherSession()
@@ -423,6 +430,14 @@ class App: AppCenterApplication {
         KeyRepeatTimer.startRepeatingKeyNextWindow()
         let prioritizedIds = TilesView.windowIdsInViewport()
         WindowThumbnails.refreshAsync(Windows.list, .refreshOnlyThumbnailsAfterShowUi, prioritizedIds: prioritizedIds)
+        #if DEBUG
+        let shownSession = SwitcherSession.current
+        // CoreAnimation cannot commit the first frame until this main-runloop turn ends.
+        DispatchQueue.main.async { [weak shownSession] in
+            guard let shownSession, SwitcherSession.current === shownSession else { return }
+            Logger.debug { "show[firstFrameReady]" }
+        }
+        #endif
     }
 
     static func checkIfShortcutsShouldBeDisabled(_ activeWindow: Window?, _ activeApp: Application?) {
@@ -523,7 +538,9 @@ class App: AppCenterApplication {
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { App.updaterController?.startUpdater() }
         #endif
         PreferencesEvents.initialize()
+        #if DEBUG
         BenchmarkRunner.startIfNeeded()
+        #endif
         endFirstLaunchWithPopoverOrSettings()
         if pendingShowSettingsWindow {
             pendingShowSettingsWindow = false
@@ -544,6 +561,9 @@ extension App: NSApplicationDelegate {
         App.shared.disableRelaunchOnLogin()
         Logger.initialize()
         MainThreadStall.observe()
+        #if DEBUG
+        MainThreadWatchdog.start()
+        #endif
         Logger.info { "Launching AltTab \(App.version)" }
         // Create the background queues first, before anything that can pump the main run loop re-entrantly
         // (the "move to /Applications" modal below, the WindowServer tap's discovery). Window.init reads

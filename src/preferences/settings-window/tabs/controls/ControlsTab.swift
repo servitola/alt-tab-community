@@ -121,8 +121,8 @@ class ControlsTab {
         gestureEditorView = makeGestureEditor()
 
         let shortcutsView = makeShortcutsView()
-        let additionalControlsButton = NSButton(title: NSLocalizedString("Additional controls…", comment: ""), target: self, action: #selector(showAdditionalControlsSettings))
-        let shortcutsButton = NSButton(title: NSLocalizedString("Shortcuts when active…", comment: ""), target: self, action: #selector(showShortcutsSettings))
+        let additionalControlsButton = NSButton(title: NSLocalizedString("Additional controls", comment: "") + "…", target: self, action: #selector(showAdditionalControlsSettings))
+        let shortcutsButton = NSButton(title: NSLocalizedString("Shortcuts when active", comment: "") + "…", target: self, action: #selector(showShortcutsSettings))
         let tools = StackView([additionalControlsButton, shortcutsButton], .horizontal)
         let view = TableGroupSetView(originalViews: [shortcutsView], toolsViews: [tools], padding: 0, bottomPadding: 0, othersAlignment: .leading, toolsAlignment: .trailing)
 
@@ -884,15 +884,15 @@ class ControlsTab {
     }
 
     /// The prompt both conflict detectors raise: unassign whatever holds the shortcut, or cancel
-    /// (Esc). `true` means the user chose to unassign.
-    static func confirmUnassigningConflict(_ informativeText: String) -> Bool {
+    /// (Esc). `true` means the user chose to unassign. It is a sheet on `window`, which defaults to Settings.
+    static func confirmUnassigningConflict(_ informativeText: String, in window: NSWindow? = SettingsWindow.shared) -> Bool {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = NSLocalizedString("Conflicting shortcut", comment: "")
         alert.informativeText = informativeText
         alert.addButton(withTitle: NSLocalizedString("Unassign existing shortcut and continue", comment: "")).setAccessibilityFocused(true)
         alert.addButton(withTitle: NSLocalizedString("Cancel", comment: "")).keyEquivalent = "\u{1b}"
-        return alert.runModal() == .alertFirstButtonReturn
+        return alert.runAttached(to: window) == .alertFirstButtonReturn
     }
 
     /// An action's name must not be split across lines by the alert's own wrapping.

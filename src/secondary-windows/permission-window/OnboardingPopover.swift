@@ -15,6 +15,18 @@ enum OnboardingPopover {
     #if DEBUG
     static func closeForQa() { close() }
     static func ownsForQa(_ window: NSWindow) -> Bool { popover?.contentViewController?.view.window === window }
+
+    /// Either beat on demand: `show` skips the first one once the shortcut has been used.
+    static func showForQa(completion: Bool) {
+        guard Menubar.statusItem != nil else { return }
+        close()
+        if completion {
+            stage = .done
+            presentCompletion()
+        } else {
+            presentFirstBeat()
+        }
+    }
     #endif
     private static var popover: AnchoredPopover?
     private static var stage = Stage.waitingForShortcut
@@ -36,12 +48,16 @@ enum OnboardingPopover {
             stage = .done
             presentCompletion()
         } else {
-            Self.popover = makePopover()
-            stage = .waitingForShortcut
-            present(makeTryItView())
-            startKeyFeedback()
+            presentFirstBeat()
         }
         return true
+    }
+
+    private static func presentFirstBeat() {
+        popover = makePopover()
+        stage = .waitingForShortcut
+        present(makeTryItView())
+        startKeyFeedback()
     }
 
     /// Called at every summon and every cycling keystroke, where the checks are the whole cost on
@@ -176,10 +192,10 @@ enum OnboardingPopover {
         return OnboardingLayout.root(stack, width: max(290, reminder.fittingSize.width + 2 * OnboardingLayout.horizontalInset))
     }
 
-    /// "Press [⌥ Option] + [⇥ Tab] any time.", the user's own keys as small keycaps between the two
+    /// "Press [⌥ Option] + [⇥ Tab] any time", the user's own keys as small keycaps between the two
     /// halves of the sentence.
     private static func pressAnyTime() -> NSView {
-        let template = NSLocalizedString("Press %@ any time.", comment: "Onboarding popover, once the shortcut was used; %@ is the keyboard shortcut")
+        let template = NSLocalizedString("Press %@ any time", comment: "Onboarding popover, once the shortcut was used; %@ is the keyboard shortcut")
         let halves = template.components(separatedBy: "%@")
         let keys = [OnboardingLayout.holdGlyphs, OnboardingLayout.nextGlyphs].map {
             KeycapView($0, name: OnboardingLayout.keyName($0), scale: .small)
@@ -198,8 +214,6 @@ enum OnboardingPopover {
         row.translatesAutoresizingMaskIntoConstraints = false
         row.alignment = .centerY
         row.spacing = 6
-        // "Drücke jederzeit %@." leaves a lone period, which belongs against the key
-        if let last = words[1], last.stringValue.allSatisfy(\.isPunctuation) { row.setCustomSpacing(2, after: keys[1]) }
         row.setAccessibilityElement(true)
         row.setAccessibilityRole(.staticText)
         row.setAccessibilityLabel(String(format: template, OnboardingLayout.holdGlyphs + OnboardingLayout.nextGlyphs))
@@ -465,7 +479,7 @@ private class DotView: NSView {
 }
 
 /// The green circle with the checkmark.
-private class SuccessTickView: NSView {
+class SuccessTickView: NSView {
     private static let diameter = CGFloat(50)
 
     init() {

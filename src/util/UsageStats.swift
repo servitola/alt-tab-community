@@ -19,6 +19,8 @@ struct UsageStats {
     /// `writeQueue`-owned. Nil value = not loaded from `UserDefaults` yet.
     private static var cache = [String: [Int]]()
     private static var dirty = Set<String>()
+    private static var malformed = Set<String>()
+    private static var knownHistory = Set<String>()
     private static var flushScheduled = false
 
     static func recordTrigger(_ shortcutIndex: Int) {
@@ -37,6 +39,20 @@ struct UsageStats {
     static func count(_ key: String, since date: Date) -> Int {
         let threshold = Int(date.timeIntervalSince1970)
         return getTimestamps(key).count { $0 >= threshold }
+    }
+
+    static func formatCount(_ n: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: n)) ?? "\(n)"
+    }
+
+    static func loadPreviousExtraShortcut(_ completion: @escaping (Bool?) -> Void) {
+        writeQueue.async {
+            let raw = defaults.object(forKey: "triggersExtraShortcuts")
+            let used = raw == nil ? false : (raw as? [Int]).map { !$0.isEmpty }
+            DispatchQueue.main.async { completion(used) }
+        }
     }
 
     static var triggerCount: Int { count("triggers", since: Date.distantPast) }
@@ -68,6 +84,7 @@ struct UsageStats {
             // `subscript(_:default:)` mutates in place; appending with array concatenation would copy the
             // whole year of timestamps on every summon.
             cache[key, default: []].append(timestamp)
+            knownHistory.insert(key)
             dirty.insert(key)
             scheduleFlushOnQueue()
         }
@@ -81,7 +98,12 @@ struct UsageStats {
 
     private static func ensureLoadedOnQueue(_ key: String) {
         guard cache[key] == nil else { return }
-        cache[key] = defaults.array(forKey: key) as? [Int] ?? []
+        let raw = defaults.object(forKey: key)
+        if raw != nil && !(raw is [Int]) {
+            malformed.insert(key)
+        }
+        if raw is [Int] { knownHistory.insert(key) }
+        cache[key] = raw as? [Int] ?? []
     }
 
     private static func loadOnQueue(_ key: String) -> [Int] {

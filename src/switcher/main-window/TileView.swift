@@ -177,8 +177,7 @@ class TileView: FlippedView {
 
     /// dockLabelIcon's badge metrics are baked into `let`s sized from the app-icon size, so it can't
     /// be reconfigured in place. Unlike the other subviews it owns no tooltip, so it's safe to
-    /// recreate. `applyShadows()` (called right after, by both setup and reapplyAppearance) gives the
-    /// fresh instance its shadow.
+    /// recreate.
     /// A fresh badge is visible and reads "0". A screen change while the switcher is open rebuilds every
     /// tile, and the refresh that follows lands a few frames later, so the fresh badge takes the tile's
     /// current one (or hides) right away.
@@ -187,6 +186,7 @@ class TileView: FlippedView {
         dockLabelIcon = TileFontIconView(badgeSize: TileFontIconView.badgeBaseSize(forIconSize: TileView.iconSize().width))
         addSubview(dockLabelIcon)
         TileView.disableImplicitLayerAnimations(on: dockLabelIcon)
+        dockLabelIcon.shadow = TileView.makeShadow(Appearance.imagesShadowColor)
         updateDockLabelIcon(window_?.dockLabel)
         updateDockLabelIconPosition()
     }
@@ -218,6 +218,14 @@ class TileView: FlippedView {
         statusIcons.isHidden = style == .appIcons
         label.alignment = style == .appIcons ? .center : .natural
         label.isHidden = style == .appIcons
+        rebuildDockLabelIconIfIconSizeChanged()
+    }
+
+    /// The app-icon size follows the active shortcut's style and size, which can differ from the one
+    /// this tile was built or last reset under.
+    private func rebuildDockLabelIconIfIconSizeChanged() {
+        guard dockLabelIcon.symbolSize != TileFontIconView.badgeBaseSize(forIconSize: TileView.iconSize().width) else { return }
+        rebuildDockLabelIcon()
     }
 
     private func updateAppIconsLabel(isFocused: Bool, isHovered: Bool) {
@@ -315,7 +323,7 @@ class TileView: FlippedView {
         if !thumbnail.isHidden {
             if let screenshot = element.thumbnail {
                 thumbnail.contentsGravity = .resize
-                let thumbnailSize = TileView.thumbnailSize(element.size, false)
+                let thumbnailSize = TileView.thumbnailSize(element.thumbnailArea?.size, false)
                 thumbnail.updateContents(screenshot, thumbnailSize)
             } else {
                 let reservesWindowGeometry = ThumbnailPlaceholderLayout.reservesWindowGeometry(
@@ -655,9 +663,9 @@ class TileView: FlippedView {
 
     private func getAccessibilityTextForBadge(_ dockLabel: String) -> String {
         if let dockLabelInt = Int(dockLabel) {
-            return "Red badge with number \(dockLabelInt)"
+            return String(format: NSLocalizedString("Red badge with number %@", comment: "VoiceOver description of an app notification badge"), UsageStats.formatCount(dockLabelInt))
         }
-        return "Red badge"
+        return NSLocalizedString("Red badge", comment: "VoiceOver description of an app notification badge")
     }
 
     static func makeShadow(_ color: NSColor?) -> NSShadow? {

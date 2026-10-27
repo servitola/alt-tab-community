@@ -101,6 +101,7 @@ enum QaLifecycle {
             permissionLock.unlock()
             SystemPermissions.checkPermissionsSoon()
         case "open-permissions": App.showPermissionsWindow()
+        case "open-settings": App.showSettingsWindow()
         case "request-accessibility": AccessibilityPermission.request()
         case "request-screen": ScreenRecordingPermission.request()
         case "skip-screen": ScreenRecordingPermission.waive()

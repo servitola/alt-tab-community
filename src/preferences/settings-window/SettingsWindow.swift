@@ -162,7 +162,7 @@ class SettingsWindow: NSWindow {
     /// rather than extend edge-to-edge. The window width includes 2× this on top of the regular
     /// `contentWidth`, so TGVs keep their natural width and gain a visible gutter on each side.
     static let sectionContentHorizontalMargin = CGFloat(15)
-    static let sidebarWidth = CGFloat(175)
+    static let sidebarWidth = max(175, makeQuitButton().intrinsicContentSize.width.rounded(.up) + 2 * sidebarHorizontalPadding)
     /// Outer left pad between the splitview divider and the TableGroupView background. Kept
     /// symmetric with `contentTrailingPadding` so the visible TGV "shoulders" match on both sides.
     private static let contentHorizontalPadding = CGFloat(5)
@@ -182,7 +182,7 @@ class SettingsWindow: NSWindow {
     private static let sectionSelectionTriggerRatioWhenScrollingUp = CGFloat(0.6)
     private static let sectionSelectionDirectionDeltaThreshold = CGFloat(0.25)
     private static let minWindowHeight = CGFloat(400)
-    private static let defaultWindowHeight = CGFloat(570)
+    private static let defaultWindowHeight = CGFloat(600)
     private static let sidebarTopInset = CGFloat(40)
     private static let logoIconSize = NSSize(width: 48, height: 48)
     static let sidebarHorizontalPadding = CGFloat(10)
@@ -208,7 +208,7 @@ class SettingsWindow: NSWindow {
     private let rightScrollView = NSScrollView()
     private let sectionsDocumentView = SettingsFlippedView(frame: .zero)
     private let sectionsStack = NSStackView()
-    private let quitButton = NSButton(title: String(format: NSLocalizedString("Quit %@", comment: "%@ is AltTab"), App.name), target: nil, action: #selector(NSApplication.terminate(_:)))
+    private let quitButton = SettingsWindow.makeQuitButton()
     private var sections = [SettingsSection]()
     private var visibleSections = [SettingsSection]()
     private var selectedSectionId: String?
@@ -420,7 +420,6 @@ class SettingsWindow: NSWindow {
 
     private func setupQuitButton(_ parent: NSView) {
         quitButton.toolTip = quitButton.title
-        quitButton.bezelStyle = .rounded
         quitButton.translatesAutoresizingMaskIntoConstraints = false
         parent.addSubview(quitButton)
         NSLayoutConstraint.activate([
@@ -428,6 +427,12 @@ class SettingsWindow: NSWindow {
             quitButton.bottomAnchor.constraint(equalTo: parent.bottomAnchor, constant: -10),
             quitButton.widthAnchor.constraint(lessThanOrEqualTo: parent.widthAnchor, constant: -Self.sidebarHorizontalPadding * 2),
         ])
+    }
+
+    private static func makeQuitButton() -> NSButton {
+        let button = NSButton(title: String(format: NSLocalizedString("Quit %@", comment: "%@ is AltTab"), App.name), target: nil, action: #selector(NSApplication.terminate(_:)))
+        button.bezelStyle = .rounded
+        return button
     }
 
     private func sectionDefinitions() -> [SettingsSectionDefinition] {

@@ -1,4 +1,5 @@
 import ShortcutRecorder
+import Carbon.HIToolbox.Events
 
 class KeyboardEventsTestable {
     static var globalShortcutsIds: [String: Int] {
@@ -6,6 +7,26 @@ class KeyboardEventsTestable {
         (0..<Preferences.maxShortcutCount).forEach { ids[Preferences.indexToName("nextWindowShortcut", $0)] = $0 }
         (0..<Preferences.maxShortcutCount).forEach { ids[Preferences.indexToName("holdShortcut", $0)] = Preferences.maxShortcutCount + $0 }
         return ids
+    }
+}
+
+/// After dismissal starts, a key still addressed to AltTab belongs to neither its closed switcher nor
+/// the target app. Let macOS deliver later keys to whichever window it actually focuses.
+enum DismissalInput {
+    private static var isDismissing = false
+
+    static func begin() { isDismissing = true }
+
+    static func cancel() { isDismissing = false }
+
+    static func discard(_ event: NSEvent) -> Bool {
+        guard isDismissing else { return false }
+        if let window = event.window, window !== TilesPanel.shared {
+            cancel()
+            return false
+        }
+        Logger.debug { "discarded key during switcher dismissal" }
+        return true
     }
 }
 

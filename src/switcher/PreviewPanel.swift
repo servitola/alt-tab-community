@@ -5,6 +5,7 @@ class PreviewPanel: NSPanel {
     private static let borderView = BorderView()
     private static var currentId: CGWindowID?
     static var shared: PreviewPanel!
+    private(set) static var windowId: CGWindowID?
 
     /// `.titled` would make it eligible, and the preview outlives the switcher after a focus (`beginHideUi`'s
     /// `keepPreview`): ordering out the key `TilesPanel` once the target is front made AppKit hand key to this
@@ -24,12 +25,14 @@ class PreviewPanel: NSPanel {
         Self.borderView.autoresizingMask = [.width, .height]
         Self.previewView.addSubview(Self.borderView)
         Self.shared = self
+        Self.windowId = CGWindowID(windowNumber)
     }
 
-    static func show(_ id: CGWindowID, _ preview: CALayerContents, _ position: CGPoint, _ size: CGSize) {
-        repositionAndResize(position, size)
+    /// `area` is top-left global: what the preview's capture covers, which a sheet can make larger than the window
+    static func show(_ id: CGWindowID, _ preview: CALayerContents, _ area: CGRect) {
+        repositionAndResize(area)
         if id != currentId {
-            previewView.updateContents(preview, size)
+            previewView.updateContents(preview, area.size)
         }
         if id != currentId || !Self.shared.isVisible {
             if Preferences.previewFadeInAnimation {
@@ -50,10 +53,10 @@ class PreviewPanel: NSPanel {
         }
     }
 
-    static func updateIfShowing(_ id: CGWindowID?,  _ preview: CALayerContents, _ position: CGPoint, _ size: CGSize) {
+    static func updateIfShowing(_ id: CGWindowID?, _ preview: CALayerContents, _ area: CGRect) {
         if Self.shared.isVisible && id == currentId {
-            repositionAndResize(position, size)
-            previewView.updateContents(preview, size)
+            repositionAndResize(area)
+            previewView.updateContents(preview, area.size)
         }
     }
 
@@ -77,8 +80,8 @@ class PreviewPanel: NSPanel {
         }
     }
 
-    private static func repositionAndResize( _ position: CGPoint, _ size: CGSize) {
-        var frame = NSRect(origin: position, size: size)
+    private static func repositionAndResize(_ area: CGRect) {
+        var frame = area
         // Flip Y coordinate from Quartz (0,0 at bottom-left) to Cocoa coordinates (0,0 at top-left)
         // Always use the primary screen as reference since all coordinates are relative to it
         frame.origin.y = NSScreen.screens.first!.frame.maxY - frame.maxY

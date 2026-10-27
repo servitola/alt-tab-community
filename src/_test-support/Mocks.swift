@@ -11,7 +11,7 @@ enum Symbols: String {
 }
 
 extension NSImage {
-    static func fromSymbol(_ symbol: Symbols, pointSize: CGFloat, rotated180: Bool = false) -> NSImage {
+    static func fromSymbol(_ symbol: Symbols, pointSize: CGFloat, rotated180: Bool = false, margin: CGFloat = 0) -> NSImage {
         let image = NSImage()
         image.isTemplate = true
         return image
@@ -78,7 +78,7 @@ class Appearance {
 // Minimal stubs so `TableGroupView.swift` / `SidebarList.swift` compile in the test target without
 // dragging in `AppearanceTab` (which `IllustratedImageThemeView` lives in) or the full
 // `SettingsWindow`. Tests never instantiate these — they only need the symbols to resolve.
-enum SettingsWindow {
+class SettingsWindow: NSWindow {
     static let contentWidth = CGFloat(700)
 }
 
