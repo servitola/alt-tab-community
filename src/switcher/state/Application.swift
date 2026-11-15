@@ -78,7 +78,7 @@ class Application: NSObject {
     init(_ runningApplication: NSRunningApplication) {
         self.runningApplication = runningApplication
         state = ApplicationState(
-            pid: runningApplication.processIdentifier,
+            pid: runningApplication.resolvedPid,
             bundleIdentifier: runningApplication.bundleIdentifier,
             localizedName: runningApplication.localizedName,
             isHidden: runningApplication.isHidden)

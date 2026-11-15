@@ -85,7 +85,7 @@ class WindowServerEvents {
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { note in
             if let app = runningApp(note) {
-                let pid = app.processIdentifier
+                let pid = app.resolvedPid
                 Applications.frontmostPid = pid
                 // Re-evaluate the "ignore shortcuts" exception the moment an app becomes frontmost, whatever
                 // happens to the window MRU below (#5842). The window-focus paths also call this, but they only
@@ -112,10 +112,10 @@ class WindowServerEvents {
             }
         }
         center.addObserver(forName: NSWorkspace.didHideApplicationNotification, object: nil, queue: .main) { note in
-            if let app = runningApp(note) { applicationVisibilityChanged(app.processIdentifier, hidden: true) }
+            if let app = runningApp(note) { applicationVisibilityChanged(app.resolvedPid, hidden: true) }
         }
         center.addObserver(forName: NSWorkspace.didUnhideApplicationNotification, object: nil, queue: .main) { note in
-            if let app = runningApp(note) { applicationVisibilityChanged(app.processIdentifier, hidden: false) }
+            if let app = runningApp(note) { applicationVisibilityChanged(app.resolvedPid, hidden: false) }
         }
     }
 

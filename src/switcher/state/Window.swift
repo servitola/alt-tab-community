@@ -391,7 +391,7 @@ class Window {
             // bumps this window directly instead of divining the focus from a racy 808 / AX read (#5596).
             WindowServerEvents.noteAltTabInitiatedFocus(cgWindowId!, application.pid)
             let targetMaybeCrossSpace = !self.spaceIds.isEmpty && !self.spaceIds.contains(originSpaceId)
-            let originFrontPid = targetMaybeCrossSpace ? NSWorkspace.shared.frontmostApplication?.processIdentifier : nil
+            let originFrontPid = targetMaybeCrossSpace ? NSWorkspace.shared.frontmostApplication?.resolvedPid : nil
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
                 guard let self else { return }
                 if self.isMinimized {

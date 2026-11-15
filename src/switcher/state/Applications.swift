@@ -3,7 +3,7 @@ import ApplicationServices
 
 class Applications {
     static var list = [Application]()
-    static var frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    static var frontmostPid = NSWorkspace.shared.frontmostApplication?.resolvedPid
     // Throttlers coalesce redundant work. They are SEPARATE from AXCallScheduler, which is a pure executor
     // (bounded pools + retry, no throttle). Each one below states what it coalesces and why:
     // A — suppress redundant inbound events: coalesce resize/move/title bursts to ≤1 attribute read per window
@@ -520,7 +520,7 @@ class Applications {
     static func addRunningApplications(_ runningApps: [NSRunningApplication], _ needToVerifyFrontmostPid: Bool) {
         runningApps.forEach { runningApp in
             let bundleIdentifier = runningApp.bundleIdentifier
-            let processIdentifier = runningApp.processIdentifier
+            let processIdentifier = runningApp.resolvedPid
             if bundleIdentifier == "com.apple.dock" {
                 DockEvents.observe(processIdentifier)
             }
@@ -537,7 +537,7 @@ class Applications {
     // The post-classification half of findOrCreate, for the discovery path where classification already
     // ran off-main via ProcessCallScheduler. Runs on main; dedups by pid so it can't race a parallel creation.
     private static func createActualApp(_ runningApp: NSRunningApplication) {
-        let pid = runningApp.processIdentifier
+        let pid = runningApp.resolvedPid
         guard !(list.contains { $0.pid == pid }) else { return }
         list.append(Application(runningApp))
     }
@@ -546,6 +546,8 @@ class Applications {
         let existingAppsToRemove = list.filter { app in terminatingApps.contains { tApp in app.runningApplication.isEqual(tApp) } }
         let existingWindowstoRemove = Windows.list.filter { window in terminatingApps.contains { tApp in window.application.runningApplication.isEqual(tApp) } }
         if existingAppsToRemove.isEmpty && existingWindowstoRemove.isEmpty { return }
+        // a terminated app's processIdentifier can be -1 (launcher-exec'd apps like Anki); the pid we tracked is authoritative
+        let pidsToClean = Set(terminatingApps.map { $0.processIdentifier } + existingAppsToRemove.map { $0.pid }).filter { $0 > 0 }
         for tApp in terminatingApps {
             let ofQuitApp = Windows.list.filter { $0.application.runningApplication.isEqual(tApp) }
             if !ofQuitApp.isEmpty { Logger.debug { "remove appQuit count=\(ofQuitApp.count) \(ofQuitApp.map { $0.debugId })" } }
@@ -553,8 +555,7 @@ class Applications {
             // comparing pid here can fail here, as it can be already nil; we use isEqual here to avoid the issue
             list.removeAll { $0.runningApplication.isEqual(tApp) }
         }
-        for tApp in terminatingApps {
-            let pid = tApp.processIdentifier
+        for pid in pidsToClean {
             AXCallScheduler.shared.removeEntry(key: "pid-\(pid)")
             AXCallScheduler.shared.removeEntries(withPrefix: "pid-\(pid)-")
             AXCallScheduler.shared.removeUnresponsivePid(pid)
