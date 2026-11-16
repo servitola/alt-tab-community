@@ -367,7 +367,28 @@ extension Optional {
 }
 
 extension NSRunningApplication {
-    func debugId() -> String { "(pid:\(processIdentifier) \(bundleIdentifier ?? bundleURL?.absoluteString ?? executableURL?.absoluteString ?? localizedName))" }
+    func debugId() -> String { "(pid:\(resolvedPid) \(bundleIdentifier ?? bundleURL?.absoluteString ?? executableURL?.absoluteString ?? localizedName))" }
+
+    /// `processIdentifier` is -1 for apps whose bundle launcher execs a different binary and exits — e.g. Anki 25+
+    /// (`net.ankiweb.launcher` → `AnkiProgramFiles/.venv/bin/python`). LaunchServices keeps the app registered but
+    /// loses the pid, so AX calls on it find no windows. Recover the pid by matching the executable path, then
+    /// confirm the candidate maps back to this same LaunchServices app.
+    var resolvedPid: pid_t {
+        let pid = processIdentifier
+        guard pid == -1, let exe = executableURL?.resolvingSymlinksInPath().path else { return pid }
+        let count = proc_listallpids(nil, 0)
+        guard count > 0 else { return pid }
+        var pids = [pid_t](repeating: 0, count: Int(count) * 2)
+        let n = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+        var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        for candidate in pids.prefix(Int(max(n, 0))) where candidate > 0 {
+            guard proc_pidpath(candidate, &path, UInt32(path.count)) > 0,
+                  URL(fileURLWithPath: String(cString: path)).resolvingSymlinksInPath().path == exe,
+                  NSRunningApplication(processIdentifier: candidate)?.isEqual(self) == true else { continue }
+            return candidate
+        }
+        return pid
+    }
 }
 
 /// this changes the behavior of interpolating optional values (e.g. "\(optionalValue)")

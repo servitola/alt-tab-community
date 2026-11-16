@@ -3,7 +3,7 @@ import ApplicationServices
 
 class Applications {
     static var list = [Application]()
-    static var frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    static var frontmostPid = NSWorkspace.shared.frontmostApplication?.resolvedPid
     // Discovery, attribute reads and WindowServer state deliberately have no clock throttle. Measured over
     // 12 lifecycle/Space/tab/volume scenarios, the old shared 200ms gate suppressed only 3 of 50 requests,
     // delayed 12 by 203-210ms, and guarded model writes costing 0.21ms mean / 0.84ms max. AX keeps one call
@@ -1192,7 +1192,7 @@ class Applications {
         runningApps.forEach { runningApp in
             let bundleIdentifier = runningApp.bundleIdentifier
             guard let processIdentifier = ApplicationPidResolver.resolve(
-                discoveredPid: nil, reportedPid: runningApp.processIdentifier) else { return }
+                discoveredPid: nil, reportedPid: runningApp.resolvedPid) else { return }
             if bundleIdentifier == "com.apple.dock" {
                 DockEvents.observe(processIdentifier)
             }
@@ -1296,7 +1296,7 @@ class Applications {
 
     static func knownPid(_ runningApp: NSRunningApplication) -> pid_t? {
         let trackedPid = list.first { $0.runningApplication.isEqual(runningApp) }?.pid
-        return ApplicationPidResolver.resolve(discoveredPid: trackedPid, reportedPid: runningApp.processIdentifier)
+        return ApplicationPidResolver.resolve(discoveredPid: trackedPid, reportedPid: runningApp.resolvedPid)
     }
 
     @discardableResult
