@@ -1,12 +1,19 @@
 import Cocoa
 
 class Menubar {
-    static var statusItem: NSStatusItem!
+    static var statusItem: NSStatusItem? { statusItemLifecycle.item }
+    private(set) static var isInitialized = false
     static var menu: NSMenu!
     static var permissionCalloutMenuItems: [NSMenuItem]?
     private static var permissionCallout: PermissionCallout?
     private static let menuDelegate = MenubarMenuDelegate()
-    private static var isVisibleObserver: NSKeyValueObservation?
+    private static let statusItemLifecycle = StatusItemLifecycle(
+        create: makeStatusItem, update: loadPreferredIcon, observeRemoval: observeRemovalFromMenubar,
+        remove: removeStatusItem, onUserRemoval: {
+            Preferences.set("menubarIconShown", "false")
+            GeneralTab.menuIconShownToggle?.setSilently(.off)
+            GeneralTab.menubarIconDropdown?.isEnabled = false
+        })
 
     @discardableResult
     static func addMenuItem(_ title: String, _ action: Selector, _ keyEquivalent: String, _ symbolName: String?, _ color: NSColor? = nil, _ target: AnyObject? = nil) -> NSMenuItem {
@@ -38,21 +45,17 @@ class Menubar {
         addMenuItem(NSLocalizedString("Check permissions…", comment: "Menubar option"), #selector(App.checkPermissions), "", "hand.raised", nil, App.self)
         menu.addItem(NSMenuItem.separator())
         addMenuItem(String(format: NSLocalizedString("About %@", comment: "Menubar option. %@ is AltTab"), App.name), #selector(App.showAboutWindow), "", "info.circle", nil, App.self)
-        addMenuItem(NSLocalizedString("Debug tools", comment: "Menubar option"), #selector(App.showDebugWindow), "", "scope", nil, App.self)
+        addMenuItem(NSLocalizedString("Debug Logs", comment: "Menubar option"), #selector(App.showDebugLogsWindow), "", "doc.text", nil, App.self)
         addMenuItem(NSLocalizedString("Send feedback", comment: "Menubar option") + "…", #selector(App.showFeedbackPanel), "", "text.bubble", nil, App.self)
         addMenuItem(NSLocalizedString("Support this project", comment: "Menubar option"), App.supportProjectAction, "", "heart.fill", .red, App.self)
         menu.addItem(NSMenuItem.separator())
         addMenuItem(String(format: NSLocalizedString("Quit %@", comment: "%@ is AltTab"), App.name), #selector(NSApplication.terminate(_:)), "q", nil) // "xmark.rectangle" is not necessary; macos automatically recognizes Quit
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button!.target = self
-        statusItem.button!.action = #selector(statusItemOnClick)
-        statusItem.button!.sendAction(on: [.leftMouseDown, .rightMouseDown])
+        isInitialized = true
         // Apply icon prefs eagerly here, while the status item is still being added to the
         // menubar. Doing it later (from PreferencesEvents.initialize) sets `button.image` after
         // the WindowServer has already laid the menubar out at its imageless default size, then
         // invalidates NSStatusBarContentView mid-FBS-scene-update — `_NSDetectedLayoutRecursion`.
         applyMenubarIconPreferences()
-        observeRemovalFromMenubar()
     }
 
     // The callout is only useful when the user lacks Screen Recording AND has settings that need it
@@ -98,14 +101,16 @@ class Menubar {
     /// letting AppKit position the menu and highlight the icon. Clearing `menu` on the next line is
     /// safe because `performClick` doesn't return until menu tracking ends.
     static func popUpMenu() {
+        guard let statusItem else { return }
         statusItem.menu = menu
         statusItem.button!.performClick(nil)
         statusItem.menu = nil
     }
 
     static func menubarIconCallback(_: NSControl?) {
-        // Guard: can be invoked before `Menubar.initialize()`, at which point `statusItem` is still nil.
-        guard statusItem != nil else { return }
+        // Guard: can be invoked before `Menubar.initialize()`. A hidden icon, however, must still
+        // allow preference changes to recreate the status item, so this can't test `statusItem`.
+        guard isInitialized else { return }
         applyMenubarIconPreferences()
         if let menubarIconDropdown = GeneralTab.menubarIconDropdown {
             menubarIconDropdown.isEnabled = Preferences.menubarIconShown
@@ -113,24 +118,34 @@ class Menubar {
     }
 
     static private func applyMenubarIconPreferences() {
-        if Preferences.menubarIconShown {
-            loadPreferredIcon()
-        } else {
-            statusItem.isVisible = false
-        }
+        statusItemLifecycle.setVisible(Preferences.menubarIconShown)
+    }
+
+    private static func makeStatusItem() -> NSStatusItem {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button!.target = self
+        item.button!.action = #selector(statusItemOnClick)
+        item.button!.sendAction(on: [.leftMouseDown, .rightMouseDown])
+        return item
+    }
+
+    private static func removeStatusItem(_ item: NSStatusItem) {
+        // A retained hidden item was reported to intercept Apple-menu clicks on macOS 15.8.1
+        // (#6142). Remove it from NSStatusBar and release our reference when hiding it.
+        NSStatusBar.system.removeStatusItem(item)
     }
 
     // The user can ⌘-drag the icon off the menubar (enabled by `.removalAllowed`). When that
     // happens, `isVisible` flips true→false and we persist the preference. Observing here in
     // `Menubar` rather than in `GeneralTab` means we react whether or not Settings is open.
-    static private func observeRemovalFromMenubar() {
-        statusItem.behavior = .removalAllowed
-        isVisibleObserver = statusItem.observe(\.isVisible, options: [.old, .new]) { _, change in
+    static private func observeRemovalFromMenubar(_ item: NSStatusItem, onRemoval: @escaping () -> Void) -> (() -> Void) {
+        item.behavior = .removalAllowed
+        let observation = item.observe(\.isVisible, options: [.old, .new]) { _, change in
             if change.oldValue == true && change.newValue == false {
-                Preferences.set("menubarIconShown", "false")
-                GeneralTab.menuIconShownToggle?.setSilently(.off)
+                onRemoval()
             }
         }
+        return { observation.invalidate() }
     }
 
     /// `NSStatusBar.system.thickness`: the status item working area, 22pt on every macOS so far
@@ -138,7 +153,8 @@ class Menubar {
     /// Keep the image's logical size at 22pt so the selection pill stays inside that band.
     /// The vector PDFs render at the screen's backing scale without changing the button's size.
     private static let iconSize = CGFloat(22)
-    static private func loadPreferredIcon() {
+
+    static private func loadPreferredIcon(_ statusItem: NSStatusItem) {
         let i = Preferences.menubarIcon.indexAsString
         let image = NSImage(named: "menubar-\(i)")!
         image.isTemplate = Preferences.menubarIcon.isTemplate

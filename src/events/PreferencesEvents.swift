@@ -85,7 +85,7 @@ class PreferencesEvents {
     }
 
     private static func applyMenubarPreferencesIfReady() {
-        guard Menubar.statusItem != nil else { return }
+        guard Menubar.isInitialized else { return }
         Menubar.menubarIconCallback(nil)
     }
 
